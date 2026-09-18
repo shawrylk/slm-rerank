@@ -21,8 +21,8 @@ from typing import List
 
 import pytest
 
-from lfm_rerank.chunker import chunk_file
-from lfm_rerank.models import CandidateChunk
+from slm_rerank.chunker import chunk_file
+from slm_rerank.models import CandidateChunk
 
 
 def assert_chunks_align_with_physical_file(chunks: List[CandidateChunk], file_path: Path) -> None:

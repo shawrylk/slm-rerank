@@ -2,7 +2,7 @@
 
 import tempfile
 from pathlib import Path
-from lfm_rerank.chunker import chunk_file, prepare_candidates, estimate_tokens
+from slm_rerank.chunker import chunk_file, prepare_candidates, estimate_tokens
 
 
 def test_python_ast_chunking():

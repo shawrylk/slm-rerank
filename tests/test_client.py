@@ -1,13 +1,13 @@
 """Unit tests for binary logprob scoring, hazard protection, and prompt construction."""
 
 import pytest
-from lfm_rerank.client import (
+from slm_rerank.client import (
     extract_binary_logprobs,
     extract_calibrated_logprobs,
     logsumexp,
     build_binary_prompt,
 )
-from lfm_rerank.models import CandidateChunk
+from slm_rerank.models import CandidateChunk
 
 
 def test_logsumexp():

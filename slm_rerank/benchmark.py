@@ -105,7 +105,7 @@ def main() -> int:
         search_dirs = [
             Path("/home/shawry/llama.cpp/src"),
             Path("/home/shawry/qc-mono-snapshot-latest/backend/src"),
-            Path("/home/shawry/lfm-kit/reranker/lfm_rerank"),
+            Path("/home/shawry/lfm-kit/reranker/slm_rerank"),
         ]
         candidate_paths = []
         for s_dir in search_dirs:

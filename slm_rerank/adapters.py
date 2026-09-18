@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Type, Union
 
 import httpx
 
-logger = logging.getLogger("lfm_rerank")
+logger = logging.getLogger("slm_rerank")
 
 # Default reference token IDs for LFM (Liquid Foundation Model) BPE vocabulary
 LFM_YES_TOKEN_IDS = {11683, 12447, 18171, 17550}  # 'yes', 'Yes', ' yes', ' Yes'

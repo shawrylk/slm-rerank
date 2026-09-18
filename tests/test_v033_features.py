@@ -14,8 +14,8 @@ import math
 import numpy as np
 import pytest
 
-from lfm_rerank.adapters import clean_token_str, YES_VARIANTS, NO_VARIANTS
-from lfm_rerank.calibration import (
+from slm_rerank.adapters import clean_token_str, YES_VARIANTS, NO_VARIANTS
+from slm_rerank.calibration import (
     BaseCalibrator,
     PlattScalingCalibrator,
     TemperatureScalingCalibrator,
@@ -23,21 +23,21 @@ from lfm_rerank.calibration import (
     logit,
     sigmoid,
 )
-from lfm_rerank.client import (
+from slm_rerank.client import (
     LFMReranker,
     apply_diversity_context_assembly,
     apply_intent_prior,
     compute_symbol_match_delta,
     extract_code_identifiers,
 )
-from lfm_rerank.eval import (
+from slm_rerank.eval import (
     BootstrapCI,
     calculate_brier_score,
     calculate_ece,
     calculate_bootstrap_confidence_intervals,
     EvalTaskResult,
 )
-from lfm_rerank.models import (
+from slm_rerank.models import (
     AmbiguityEvent,
     CandidateChunk,
     Citation,

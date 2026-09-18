@@ -45,7 +45,7 @@ from .models import (
 from .verifier import GroundTruthVerifier
 import re
 
-logger = logging.getLogger("lfm_rerank")
+logger = logging.getLogger("slm_rerank")
 
 # Backward compatibility references
 YES_TOKEN_IDS = LFM_YES_TOKEN_IDS

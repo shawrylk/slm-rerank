@@ -5,14 +5,14 @@ import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
-from lfm_rerank.client import (
+from slm_rerank.client import (
     DEFAULT_INTENT_THRESHOLDS,
     LFMReranker,
     calculate_percentile,
     detect_query_intent,
     is_doc_chunk,
 )
-from lfm_rerank.models import (
+from slm_rerank.models import (
     CandidateChunk,
     GroundTruthStatus,
     QueryIntent,
@@ -274,7 +274,7 @@ def test_top_3_floor_with_below_threshold_flags():
 def test_operational_telemetry_tracking_fields():
     async def _test():
         with tempfile.TemporaryDirectory() as tmpdir:
-            from lfm_rerank.cache import RerankCache
+            from slm_rerank.cache import RerankCache
             cache = RerankCache(db_path=Path(tmpdir) / "cache.db")
             reranker = LFMReranker(cache=cache)
 
@@ -329,7 +329,7 @@ def test_operational_telemetry_tracking_fields():
 def test_apply_intent_prior_log_odds():
     """Verify log-odds prior formulation in logit space."""
     import math
-    from lfm_rerank.client import apply_intent_prior
+    from slm_rerank.client import apply_intent_prior
 
     # 1. Zero delta leaves probability unchanged
     assert abs(apply_intent_prior(0.50, 0.0) - 0.50) < 1e-5
@@ -354,7 +354,7 @@ def test_apply_intent_prior_log_odds():
 
 
 def test_intent_confidence_heuristic_and_scaling():
-    from lfm_rerank.client import detect_query_intent_with_confidence
+    from slm_rerank.client import detect_query_intent_with_confidence
 
     # High confidence: multiple keywords
     intent, conf = detect_query_intent_with_confidence("fix bug and crash error in handler")

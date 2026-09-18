@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from lfm_rerank.adapters import (
+from slm_rerank.adapters import (
     GenericOpenAIProfile,
     GemmaProfile,
     LFMProfile,
@@ -22,10 +22,10 @@ from lfm_rerank.adapters import (
     probe_and_detect_profile_sync,
     probe_tokenizer_tokens_sync,
 )
-from lfm_rerank.cache import RerankCache
-from lfm_rerank.cli import parse_args
-from lfm_rerank.client import LFMReranker
-from lfm_rerank.config import load_config, resolve_endpoint_and_model, save_config
+from slm_rerank.cache import RerankCache
+from slm_rerank.cli import parse_args
+from slm_rerank.client import LFMReranker
+from slm_rerank.config import load_config, resolve_endpoint_and_model, save_config
 
 
 # ---------------------------------------------------------------------------
@@ -491,7 +491,7 @@ def test_live_server_8034_if_available():
 
     resp = reranker.rerank_sync(
         query="calculate brier score",
-        candidates=["lfm_rerank/eval.py"],
+        candidates=["slm_rerank/eval.py"],
         no_cache=True,
     )
     assert len(resp.results) > 0

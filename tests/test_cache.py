@@ -2,7 +2,7 @@
 
 import tempfile
 from pathlib import Path
-from lfm_rerank.cache import RerankCache
+from slm_rerank.cache import RerankCache
 
 
 def test_cache_put_and_get():

@@ -1,7 +1,7 @@
 """Unit tests for formal calibration metrics: Brier score, ECE, and reliability table."""
 
 import pytest
-from lfm_rerank.eval import (
+from slm_rerank.eval import (
     calculate_auprc,
     calculate_auroc,
     calculate_brier_score,

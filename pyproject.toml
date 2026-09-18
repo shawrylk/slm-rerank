@@ -3,7 +3,7 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "lfm-rerank"
+name = "slm-rerank"
 version = "0.4.0"
 description = "Model-Agnostic Wide Reranker with Ground-Truth Verification and Dynamic Logprob Scoring"
 readme = "README.md"
@@ -20,10 +20,10 @@ dependencies = [
 ]
 
 [project.scripts]
-lfm-rerank = "lfm_rerank.cli:main"
-lfm-rerank-bench = "lfm_rerank.benchmark:main"
-lfm-rerank-eval = "lfm_rerank.eval:main"
+slm-rerank = "slm_rerank.cli:main"
+slm-rerank-bench = "slm_rerank.benchmark:main"
+slm-rerank-eval = "slm_rerank.eval:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["lfm_rerank*"]
+include = ["slm_rerank*"]

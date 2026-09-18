@@ -1,4 +1,4 @@
-# Model-Agnostic Wide Reranker (`lfm-rerank`)
+# Model-Agnostic Wide Reranker (`slm-rerank`)
 
 The **Wide Reranker** is an ultra-high-throughput, prefill-dominant semantic filter and reranker for codebases and document collections. Originally designed for Liquid Foundation Models (**LFM 2.5 8B-A1B**), it is now **completely AI model agnostic**, supporting:
 - **LFM 2.5** (ChatML with `<think>\n</think>\n` bypass)
@@ -11,7 +11,7 @@ The **Wide Reranker** is an ultra-high-throughput, prefill-dominant semantic fil
 
 ## Key Architectural Highlights
 
-### 1. Model / Provider Adapter Architecture (`lfm_rerank/adapters.py`)
+### 1. Model / Provider Adapter Architecture (`slm_rerank/adapters.py`)
 - Base `ModelProfile` / `ProviderAdapter` interface:
   - `name`: identifier (e.g. `'lfm'`, `'qwen'`, `'gemma'`, `'rwkv'`, `'openai'`)
   - `format_prompt(query, chunk_content, file_path, symbol, intent) -> str`
@@ -32,7 +32,7 @@ The **Wide Reranker** is an ultra-high-throughput, prefill-dominant semantic fil
 ### 3. Model Isolation in Persistent SQLite Cache
 - SQLite cache key is isolated by active model profile:
   $$\text{cache\_key} = \text{sha256}(f"\{\text{model\_id}\}:\{\text{normalized\_query}\}:\{\text{chunk\_hash}\}")$$
-- Stored locally at `~/.cache/lfm-rerank/cache.db`.
+- Stored locally at `~/.cache/slm-rerank/cache.db`.
 - Switching between LFM, Qwen, Gemma, or RWKV guarantees zero score cross-contamination.
 
 ### 4. Auto-Detection & CLI Selection
@@ -55,30 +55,30 @@ pip install -e . --break-system-packages
 ### Model Selection & Auto-Detection
 ```bash
 # Auto-detect model from default port 8034 (LFM)
-lfm-rerank --query "auth middleware" src/**/*.ts
+slm-rerank --query "auth middleware" src/**/*.ts
 
 # Explicitly target Qwen on port 8033
-lfm-rerank --query "auth middleware" src/**/*.ts --model qwen --base-url http://localhost:8033/v1
+slm-rerank --query "auth middleware" src/**/*.ts --model qwen --base-url http://localhost:8033/v1
 
 # Target Gemma on Ollama
-lfm-rerank --query "find cache key" src/**/*.py --model gemma --base-url http://localhost:11434/v1
+slm-rerank --query "find cache key" src/**/*.py --model gemma --base-url http://localhost:11434/v1
 
 # Target RWKV on port 8000
-lfm-rerank --query "linear attention state" src/**/*.py --model rwkv -e http://localhost:8000/v1
+slm-rerank --query "linear attention state" src/**/*.py --model rwkv -e http://localhost:8000/v1
 ```
 
 ### Piping from Git / Find
 ```bash
-git ls-files "*.py" | lfm-rerank --query "brier score calibration" --threshold 0.65
+git ls-files "*.py" | slm-rerank --query "brier score calibration" --threshold 0.65
 ```
 
 ### Cache Management
 ```bash
 # Bypass cache for fresh live evaluation
-lfm-rerank --query "auth" src/*.py --no-cache
+slm-rerank --query "auth" src/*.py --no-cache
 
 # Clear cache entries
-lfm-rerank --clear-cache --query "auth" src/*.py
+slm-rerank --clear-cache --query "auth" src/*.py
 ```
 
 ---
@@ -104,7 +104,7 @@ timeout: 45.0
 
 ```python
 import asyncio
-from lfm_rerank import Reranker, QwenProfile
+from slm_rerank import Reranker, QwenProfile
 
 async def main():
     # Model-agnostic initialization (auto-detects or uses explicit profile)

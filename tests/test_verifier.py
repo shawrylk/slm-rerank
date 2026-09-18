@@ -4,8 +4,8 @@ import tempfile
 from pathlib import Path
 import pytest
 
-from lfm_rerank.models import CandidateChunk, GroundTruthStatus
-from lfm_rerank.verifier import GroundTruthVerifier
+from slm_rerank.models import CandidateChunk, GroundTruthStatus
+from slm_rerank.verifier import GroundTruthVerifier
 
 
 @pytest.fixture
