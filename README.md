@@ -163,6 +163,72 @@ half-weight keeps the rest from doing damage, but expansion quality is bounded b
 
 ---
 
+## Grounded code review (v0.8.0)
+
+The reranker answers *which chunk is relevant* with a calibrated probability. It writes no prose,
+so it cannot invent a finding. A generative model can, and a review that reports an invented
+finding is worse than no review.
+
+`slm-rerank-review` closes that gap. It retrieves with the same calibrated scorer, asks the model
+for candidate findings through the native `/completion` endpoint only (`/v1/chat/completions`
+applies a chat template and is not usable here), then checks every candidate against the physical
+file before reporting it.
+
+### What is guaranteed, and what is not
+
+Three checks run, in order. The first two are deterministic:
+
+1. **Evidence gate.** The quoted evidence must be a line of the cited chunk. A fabricated quote is
+   dropped. A multi-line quote collapsed onto one line still matches.
+2. **Identifier gate.** Every code identifier the finding names must exist in the cited chunk. A
+   finding about `onSkip` in a file that has no `onSkip` is dropped.
+3. **Support gate (best effort).** The calibrated binary scorer judges whether the evidence
+   supports the claim. This is a filter, not a guarantee: a small model can still read a real line
+   and draw the wrong conclusion. Set `--no-support` to run the evidence and identifier gates
+   alone.
+
+Every failure path returns fewer findings rather than raising, so a missing or confused model
+degrades the review; it never fabricates one.
+
+### Usage
+
+```bash
+# Review files or globs, with all three gates
+slm-rerank-review "frontend/src/**/*.tsx" --query "find real defects" --top 5
+
+# Evidence and identifier gates only, no semantic judge
+slm-rerank-review src/app.ts --no-support
+
+# Machine-readable report
+slm-rerank-review src/app.ts --json
+```
+
+Reasons a candidate is not reported are stable strings: `EMPTY_EVIDENCE`, `EVIDENCE_TOO_SHORT`,
+`EVIDENCE_NOT_FOUND`, `CLAIM_SYMBOL_NOT_IN_CHUNK`, `CLAIM_NOT_SUPPORTED`, `SUPPORT_UNVERIFIED`,
+`CHUNK_UNREADABLE`.
+
+### Trust benchmark
+
+```bash
+slm-rerank-review-bench          # deterministic, no model needed
+slm-rerank-review-bench --live   # also run retrieval and generation against the local model
+```
+
+The offline corpus carries findings the local model actually produced during the
+quality-control-mono guide-tour review, each with evidence that is absent from the target file. The
+benchmark proves the deterministic gates report every supported finding and drop every fabricated
+one:
+
+| Corpus | Claims | Reported | Dropped |
+| --- | ---: | ---: | ---: |
+| Supported (evidence on disk) | 2 | 2 | 0 |
+| Fabricated (evidence absent) | 6 | 0 | 6 |
+| Symbol-invented (symbol absent) | 3 | 0 | 3 |
+
+Reported precision is `100%` with the gates and `18.18%` without them.
+
+---
+
 ## Remote & Multi-Machine Setup
 
 Discovery probes **ports on one host**. Running the reranker on a laptop while the GPU box

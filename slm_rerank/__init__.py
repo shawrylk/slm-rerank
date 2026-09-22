@@ -100,8 +100,23 @@ from .models import (
     Telemetry,
 )
 from .verifier import GroundTruthVerifier
+from .review import (
+    DEFAULT_SUPPORT_THRESHOLD,
+    DroppedClaim,
+    ReviewClaim,
+    ReviewFinding,
+    ReviewReport,
+    extract_claim_identifiers,
+    format_review_prompt,
+    parse_review_claims,
+    read_citation_lines,
+    render_review_report,
+    review,
+    review_sync,
+    verify_claim,
+)
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 __all__ = [
     "LFMReranker",
@@ -125,6 +140,20 @@ __all__ = [
     "RerankCache",
     "GroundTruthVerifier",
     "GroundTruthStatus",
+    # Grounded review (v0.8.0)
+    "ReviewClaim",
+    "ReviewFinding",
+    "DroppedClaim",
+    "ReviewReport",
+    "review",
+    "review_sync",
+    "verify_claim",
+    "parse_review_claims",
+    "format_review_prompt",
+    "extract_claim_identifiers",
+    "read_citation_lines",
+    "render_review_report",
+    "DEFAULT_SUPPORT_THRESHOLD",
     "QueryIntent",
     "Citation",
     "CandidateChunk",
