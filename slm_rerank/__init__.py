@@ -101,12 +101,14 @@ from .models import (
 )
 from .verifier import GroundTruthVerifier
 from .review import (
+    DEFAULT_CONTRADICTION_THRESHOLD,
     DEFAULT_SUPPORT_THRESHOLD,
     DroppedClaim,
     ReviewClaim,
     ReviewFinding,
     ReviewReport,
     extract_claim_identifiers,
+    format_contradiction_prompt,
     format_review_prompt,
     parse_review_claims,
     read_citation_lines,
@@ -154,6 +156,8 @@ __all__ = [
     "read_citation_lines",
     "render_review_report",
     "DEFAULT_SUPPORT_THRESHOLD",
+    "DEFAULT_CONTRADICTION_THRESHOLD",
+    "format_contradiction_prompt",
     "QueryIntent",
     "Citation",
     "CandidateChunk",

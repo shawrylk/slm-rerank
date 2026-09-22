@@ -26,7 +26,15 @@ from rich.console import Console
 from rich.table import Table
 
 from .models import Citation
-from .review import ReviewClaim, ReviewFinding, DroppedClaim, read_citation_lines, verify_claim
+from .review import (
+    DEFAULT_CONTRADICTION_THRESHOLD,
+    DEFAULT_SUPPORT_THRESHOLD,
+    ReviewClaim,
+    _judge_contradiction,
+    _judge_support,
+    read_citation_lines,
+    verify_claim,
+)
 
 console = Console()
 
@@ -180,6 +188,100 @@ async def run_live(source_path: Path, endpoint: Optional[str], model: Optional[s
     return 0
 
 
+# Labeled semantic cases. Each has evidence on disk, so the deterministic gates pass and the
+# semantic judge decides. `supported` is the ground truth: does the evidence prove the claim?
+SEMANTIC_CASES: Sequence[dict] = (
+    {
+        "claim": "The click handler closes over count instead of using the updater form",
+        "evidence": "onClick={() => setCount(count + 1)}",
+        "supported": True,
+    },
+    {
+        "claim": "State is written inside an effect with an empty dependency array",
+        "evidence": "setCount(count + 1);",
+        "supported": True,
+    },
+    {
+        "claim": "The state variable is not initialized with a default value",
+        "evidence": "const [count, setCount] = useState(0);",
+        "supported": False,
+    },
+    {
+        "claim": "useEffect runs on every render instead of on mount",
+        "evidence": "useEffect(() => {",
+        "supported": False,
+    },
+    {
+        "claim": "The component does not export a default value",
+        "evidence": "export function Counter(): React.JSX.Element {",
+        "supported": False,
+    },
+)
+
+
+async def run_semantic(
+    engine,
+    source_path: Path,
+    support_threshold: float,
+    contradiction_threshold: float,
+) -> int:
+    """Measure the semantic gates on the labeled corpus. Requires the model."""
+    import asyncio
+
+    import httpx
+
+    lines = read_citation_lines(Citation(file=str(source_path), start_line=1, end_line=len(FIXTURE_SOURCE.splitlines()))) or []
+    semaphore = asyncio.Semaphore(4)
+    rows = []
+    async with httpx.AsyncClient(timeout=60) as client:
+        for case in SEMANTIC_CASES:
+            claim = ReviewClaim(
+                text=case["claim"],
+                evidence=case["evidence"],
+                citation=Citation(file=str(source_path), start_line=1, end_line=len(lines), symbol="Counter"),
+            )
+            finding, rejected = verify_claim(claim, lines)
+            if finding is None:
+                rows.append((case["claim"], "deterministic", rejected.reason if rejected else "?", case["supported"], None, None))
+                continue
+            support_status, support_score = await _judge_support(engine, claim, finding.evidence, 60, client, semaphore)
+            contradiction_status, contradiction_score = await _judge_contradiction(engine, claim, finding.evidence, 60, client, semaphore)
+            support_ok = support_status != "scored" or (support_score is not None and support_score >= support_threshold)
+            contradiction_fires = contradiction_status == "scored" and contradiction_score is not None and contradiction_score >= contradiction_threshold
+            accepted = support_ok and not contradiction_fires
+            rows.append((case["claim"], "accepted" if accepted else "rejected", "", case["supported"], support_score, contradiction_score))
+
+    tp = sum(1 for r in rows if r[3] and r[1] == "accepted")
+    fp = sum(1 for r in rows if not r[3] and r[1] == "accepted")
+    tn = sum(1 for r in rows if not r[3] and r[1] != "accepted")
+    fn = sum(1 for r in rows if r[3] and r[1] != "accepted")
+    total = len(rows)
+    accuracy = (tp + tn) / total if total else 0.0
+    precision = tp / (tp + fp) if (tp + fp) else 1.0
+    recall = tp / (tp + fn) if (tp + fn) else 1.0
+
+    table = Table(title="Grounded review - semantic gate (live, labeled)", header_style="bold magenta", show_lines=True)
+    table.add_column("Claim", style="bold", max_width=46)
+    table.add_column("Truth", justify="center")
+    table.add_column("Decision", justify="center")
+    table.add_column("Support", justify="right")
+    table.add_column("Contradict", justify="right")
+    for claim_text, decision, reason, supported, support_score, contradiction_score in rows:
+        table.add_row(
+            claim_text,
+            "supported" if supported else "unsupported",
+            decision if decision != "deterministic" else f"dropped:{reason}",
+            "-" if support_score is None else f"{support_score:.2f}",
+            "-" if contradiction_score is None else f"{contradiction_score:.2f}",
+        )
+    console.print(table)
+    console.print(
+        f"Semantic gate: accuracy {accuracy:.2%} | precision {precision:.2%} | recall {recall:.2%} "
+        f"(tp {tp}, fp {fp}, tn {tn}, fn {fn})"
+    )
+    return 1 if fp else 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="slm-rerank-review-bench", description="Trust benchmark for grounded code review.")
     parser.add_argument("--live", action="store_true", help="Also run retrieval and generation against the local model.")
@@ -218,7 +320,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.live:
             import asyncio
 
-            return asyncio.run(run_live(source_path, args.endpoint, args.model, args.top_k))
+            from .client import LFMReranker
+
+            endpoint = args.endpoint
+            model = args.model
+            engine = LFMReranker(endpoint=endpoint, model=model) if (endpoint or model) else LFMReranker()
+            code = asyncio.run(run_live(source_path, endpoint, model, args.top_k))
+            semantic_code = asyncio.run(
+                run_semantic(engine, source_path, DEFAULT_SUPPORT_THRESHOLD, DEFAULT_CONTRADICTION_THRESHOLD)
+            )
+            return code or semantic_code
     return 0
 
 

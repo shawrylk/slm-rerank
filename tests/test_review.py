@@ -9,6 +9,7 @@ import pytest
 review_mod = importlib.import_module("slm_rerank.review")
 from slm_rerank.models import Citation, RerankResponse, RerankResultItem, Telemetry
 from slm_rerank.review import (
+    REASON_CLAIM_CONTRADICTED,
     REASON_CLAIM_SYMBOL_NOT_IN_CHUNK,
     REASON_EMPTY_EVIDENCE,
     REASON_EVIDENCE_NOT_FOUND,
@@ -239,6 +240,51 @@ def test_review_drops_a_claim_when_the_support_judge_cannot_run(tmp_path, monkey
 
     assert report.claims_verified == 0
     assert report.dropped[0].reason == review_mod.REASON_SUPPORT_UNVERIFIED
+
+
+def test_review_drops_a_claim_the_contradiction_judge_flags(tmp_path, monkeypatch):
+    path = tmp_path / "a.tsx"
+    path.write_text("export function f() {\n  setCount(count + 1);\n}\n", encoding="utf-8")
+    item = _item_for(path, 1, 3)
+
+    async def fake_generate(completion_url, prompt, timeout, client):  # noqa: ANN001
+        return "FINDING: setCount is called | EVIDENCE: setCount(count + 1);\n"
+
+    async def support_ok(engine, claim, evidence, timeout, client, semaphore):  # noqa: ANN001
+        return "scored", 0.9
+
+    async def contradiction(engine, claim, evidence, timeout, client, semaphore):  # noqa: ANN001
+        return "scored", 0.8
+
+    monkeypatch.setattr(review_mod, "_generate", fake_generate)
+    monkeypatch.setattr(review_mod, "_judge_support", support_ok)
+    monkeypatch.setattr(review_mod, "_judge_contradiction", contradiction)
+    report = review_mod.review_sync("review", [str(path)], reranker=_FakeReranker(item))
+
+    assert report.claims_verified == 0
+    assert report.dropped[0].reason == REASON_CLAIM_CONTRADICTED
+
+
+def test_review_keeps_a_claim_when_the_contradiction_judge_is_unavailable(tmp_path, monkeypatch):
+    path = tmp_path / "a.tsx"
+    path.write_text("export function f() {\n  setCount(count + 1);\n}\n", encoding="utf-8")
+    item = _item_for(path, 1, 3)
+
+    async def fake_generate(completion_url, prompt, timeout, client):  # noqa: ANN001
+        return "FINDING: setCount is called | EVIDENCE: setCount(count + 1);\n"
+
+    async def support_ok(engine, claim, evidence, timeout, client, semaphore):  # noqa: ANN001
+        return "scored", 0.9
+
+    async def contradiction_skipped(engine, claim, evidence, timeout, client, semaphore):  # noqa: ANN001
+        return "skipped", None
+
+    monkeypatch.setattr(review_mod, "_generate", fake_generate)
+    monkeypatch.setattr(review_mod, "_judge_support", support_ok)
+    monkeypatch.setattr(review_mod, "_judge_contradiction", contradiction_skipped)
+    report = review_mod.review_sync("review", [str(path)], reranker=_FakeReranker(item))
+
+    assert report.claims_verified == 1
 
 
 def test_review_skips_the_support_judge_when_disabled(tmp_path, monkeypatch):
