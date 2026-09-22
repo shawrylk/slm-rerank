@@ -41,7 +41,21 @@ The **Wide Reranker** is an ultra-high-throughput, prefill-dominant semantic fil
 
 ---
 
-## Installation
+## Installation & Quickstart
+
+### Option A: npm / npx (Zero Python, Zero PyTorch — Ideal for Laptops & Remote LAN)
+
+You can run `slm-rerank` directly on any machine with Node.js >= 20 without installing Python:
+
+```bash
+# Direct execution via npx (points to local or LAN GPU endpoint)
+npx slm-rerank -q "user authentication token" -e "http://<gpu-host-ip>:8034/v1" src/**/*.ts
+
+# Or install globally
+npm install -g slm-rerank
+```
+
+### Option B: Python (Rich Terminal Table & Local Hardware Server)
 
 ```bash
 cd /home/shawry/lfm-kit/reranker
