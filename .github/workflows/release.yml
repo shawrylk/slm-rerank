@@ -33,4 +33,4 @@ jobs:
           [ "$tagged" = "$packaged" ] || { echo "tag $tagged != package $packaged"; exit 1; }
 
       # Trusted publishing: the registry trusts this repository and workflow via OIDC
-      - run: npm publish --access public
+      - run: npm publish --access public --provenance
