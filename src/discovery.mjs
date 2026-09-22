@@ -70,7 +70,7 @@ export async function autoDiscoverEndpoint({
 }
 
 /**
- * Smart candidate file auto-discovery via ripgrep (rg) or git ls-files fallback.
+ * Smart candidate file auto-discovery via ripgrep (rg), git grep, or git ls-files.
  * Allows running `slm-rerank -q "query"` without passing manual file globs.
  */
 export function discoverCandidateFiles(query, { cwd = process.cwd(), limit = 60 } = {}) {
@@ -83,20 +83,36 @@ export function discoverCandidateFiles(query, { cwd = process.cwd(), limit = 60 
     "code", "file", "function", "method", "class", "find", "search", "how", "what", "where"
   ]);
 
-  const terms = query
+  const rawWords = query
     .toLowerCase()
     .match(/\b[a-z0-9_]{2,}\b/g)
     ?.filter(w => !stopWords.has(w)) || [];
 
-  if (!terms.length) {
-    terms.push(query.trim().split(/\s+/)[0]);
+  if (!rawWords.length) {
+    rawWords.push(query.trim().split(/\s+/)[0]);
   }
 
+  // Stemming & term expansion (e.g. chunking -> chunk)
+  const expandedTerms = [...rawWords];
+  for (const t of rawWords) {
+    if (t.endsWith("ing") && t.length > 4) {
+      const stem = t.slice(0, -3);
+      if (!expandedTerms.includes(stem)) expandedTerms.push(stem);
+    } else if (t.endsWith("ed") && t.length > 3) {
+      const stem = t.slice(0, -2);
+      if (!expandedTerms.includes(stem)) expandedTerms.push(stem);
+    } else if (t.endsWith("s") && t.length > 3) {
+      const stem = t.slice(0, -1);
+      if (!expandedTerms.includes(stem)) expandedTerms.push(stem);
+    }
+  }
+
+  const codeExts = new Set([".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".rs", ".go", ".c", ".cpp", ".h"]);
   const collectedFiles = new Set();
 
-  // Try ripgrep first (extremely fast in large monorepos)
+  // 1. Try ripgrep first
   try {
-    for (const term of terms.slice(0, 3)) {
+    for (const term of expandedTerms.slice(0, 3)) {
       if (collectedFiles.size >= limit) break;
       const res = spawnSync("rg", [
         "--files-with-matches",
@@ -115,7 +131,7 @@ export function discoverCandidateFiles(query, { cwd = process.cwd(), limit = 60 
       if (res.status === 0 && res.stdout) {
         for (const line of res.stdout.split("\n")) {
           const trimmed = line.trim();
-          if (trimmed && fs.existsSync(path.resolve(cwd, trimmed))) {
+          if (trimmed && fs.existsSync(path.resolve(cwd, trimmed)) && codeExts.has(path.extname(trimmed))) {
             collectedFiles.add(trimmed);
             if (collectedFiles.size >= limit) break;
           }
@@ -123,28 +139,45 @@ export function discoverCandidateFiles(query, { cwd = process.cwd(), limit = 60 
       }
     }
   } catch {
-    // ripgrep not available or failed
+    // ripgrep not available
   }
 
-  // Fallback to git ls-files if ripgrep found nothing or isn't installed
+  // 2. Fallback to git grep if ripgrep not available or found nothing
+  if (collectedFiles.size === 0) {
+    try {
+      for (const term of expandedTerms.slice(0, 3)) {
+        if (collectedFiles.size >= limit) break;
+        const gitGrep = spawnSync("git", ["grep", "-l", "-i", term], { cwd, encoding: "utf-8" });
+        if (gitGrep.status === 0 && gitGrep.stdout) {
+          for (const line of gitGrep.stdout.split("\n")) {
+            const trimmed = line.trim();
+            if (trimmed && fs.existsSync(path.resolve(cwd, trimmed)) && codeExts.has(path.extname(trimmed))) {
+              collectedFiles.add(trimmed);
+              if (collectedFiles.size >= limit) break;
+            }
+          }
+        }
+      }
+    } catch {
+      // git grep failed
+    }
+  }
+
+  // 3. Fallback to git ls-files path matching
   if (collectedFiles.size === 0) {
     try {
       const gitRes = spawnSync("git", ["ls-files"], { cwd, encoding: "utf-8" });
       if (gitRes.status === 0 && gitRes.stdout) {
-        const allFiles = gitRes.stdout.split("\n").filter(f => {
-          const ext = path.extname(f);
-          return [".ts", ".tsx", ".js", ".jsx", ".mjs", ".py", ".rs", ".go", ".cpp", ".c", ".h"].includes(ext);
-        });
+        const allFiles = gitRes.stdout.split("\n").filter(f => codeExts.has(path.extname(f)));
 
         for (const f of allFiles) {
           const lower = f.toLowerCase();
-          if (terms.some(t => lower.includes(t))) {
+          if (expandedTerms.some(t => lower.includes(t))) {
             collectedFiles.add(f);
             if (collectedFiles.size >= limit) break;
           }
         }
 
-        // If still empty, sample top 20 files
         if (collectedFiles.size === 0) {
           for (const f of allFiles.slice(0, 20)) {
             collectedFiles.add(f);

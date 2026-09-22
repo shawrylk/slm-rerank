@@ -1,12 +1,13 @@
 """
 Multi-Port Endpoint & Smart File Auto-Discovery for SLM Reranker.
-Scans distinct model ports across the 8033-8040 range and discovers candidate files via ripgrep.
+Scans distinct model ports across the 8033-8040 range and discovers candidate files via ripgrep/git grep.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -90,7 +91,7 @@ async def auto_discover_endpoint(
 
 def discover_candidate_files(query: str, cwd: Optional[str] = None, limit: int = 60) -> List[str]:
     """
-    Smart candidate file discovery using ripgrep (rg) with git ls-files fallback.
+    Smart candidate file discovery using ripgrep (rg) with git grep / git ls-files fallback.
     Extracts high-signal query terms to locate matching files across large codebases in milliseconds.
     """
     target_dir = cwd or os.getcwd()
@@ -103,17 +104,33 @@ def discover_candidate_files(query: str, cwd: Optional[str] = None, limit: int =
         "code", "codes", "file", "files", "function", "method", "class", "find", "search", "how", "what", "where"
     }
 
-    import re
-    words = re.findall(r"\b[a-zA-Z0-9_]{2,}\b", query.lower())
-    terms = [w for w in words if w not in stop_words]
-    if not terms and words:
-        terms = [words[0]]
+    raw_words = re.findall(r"\b[a-zA-Z0-9_]{2,}\b", query.lower())
+    terms = [w for w in raw_words if w not in stop_words]
+    if not terms and raw_words:
+        terms = [raw_words[0]]
 
+    # Stemming & term expansion (e.g. chunking -> chunk)
+    expanded_terms = list(terms)
+    for t in terms:
+        if t.endswith("ing") and len(t) > 4:
+            stem = t[:-3]
+            if stem not in expanded_terms:
+                expanded_terms.append(stem)
+        elif t.endswith("ed") and len(t) > 3:
+            stem = t[:-2]
+            if stem not in expanded_terms:
+                expanded_terms.append(stem)
+        elif t.endswith("s") and len(t) > 3:
+            stem = t[:-1]
+            if stem not in expanded_terms:
+                expanded_terms.append(stem)
+
+    code_exts = {".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".rs", ".go", ".c", ".cpp", ".h"}
     collected: set[str] = set()
 
-    # 1. Try ripgrep
+    # 1. Try ripgrep if installed
     if shutil.which("rg"):
-        for term in terms[:3]:
+        for term in expanded_terms[:3]:
             if len(collected) >= limit:
                 break
             try:
@@ -135,27 +152,49 @@ def discover_candidate_files(query: str, cwd: Optional[str] = None, limit: int =
                 if res.returncode == 0 and res.stdout:
                     for line in res.stdout.strip().split("\n"):
                         f = line.strip()
-                        if f and os.path.isfile(os.path.join(target_dir, f)):
+                        if f and os.path.isfile(os.path.join(target_dir, f)) and any(f.endswith(ext) for ext in code_exts):
                             collected.add(f)
                             if len(collected) >= limit:
                                 break
             except Exception:
                 pass
 
-    # 2. Fallback to git ls-files if ripgrep found nothing
+    # 2. Fallback to git grep if ripgrep not installed or returned nothing
+    if not collected and shutil.which("git"):
+        for term in expanded_terms[:3]:
+            if len(collected) >= limit:
+                break
+            try:
+                cmd = ["git", "grep", "-l", "-i", term]
+                res = subprocess.run(cmd, cwd=target_dir, capture_output=True, text=True, timeout=3.0)
+                if res.returncode == 0 and res.stdout:
+                    for line in res.stdout.strip().split("\n"):
+                        f = line.strip()
+                        if f and os.path.isfile(os.path.join(target_dir, f)) and any(f.endswith(ext) for ext in code_exts):
+                            collected.add(f)
+                            if len(collected) >= limit:
+                                break
+            except Exception:
+                pass
+
+    # 3. Fallback to git ls-files path matching
     if not collected and shutil.which("git"):
         try:
             res = subprocess.run(["git", "ls-files"], cwd=target_dir, capture_output=True, text=True, timeout=3.0)
             if res.returncode == 0 and res.stdout:
-                code_exts = {".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".rs", ".go", ".c", ".cpp", ".h"}
                 for line in res.stdout.strip().split("\n"):
                     f = line.strip()
                     if any(f.endswith(ext) for ext in code_exts):
                         f_lower = f.lower()
-                        if any(t in f_lower for t in terms):
+                        if any(t in f_lower for t in expanded_terms):
                             collected.add(f)
                             if len(collected) >= limit:
                                 break
+                if not collected:
+                    for line in res.stdout.strip().split("\n")[:20]:
+                        f = line.strip()
+                        if any(f.endswith(ext) for ext in code_exts):
+                            collected.add(f)
         except Exception:
             pass
 
