@@ -16,6 +16,7 @@ from .client import LFMReranker
 from .config import load_config, resolve_endpoint_and_model
 from rich.console import Console
 from .discovery import auto_discover_endpoint, discover_candidate_files
+from .expander import expand_query
 from .display import console, print_results
 from .stubber import generate_ghost_stub
 from .verifier import GroundTruthVerifier
@@ -65,6 +66,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         type=str,
         default=None,
         help="Target server host (default: 127.0.0.1, or SLM_HOST/RERANKER_HOST)",
+    )
+    parser.add_argument(
+        "--expand",
+        action="store_true",
+        help="Ask the local model for extra search terms before auto-discovery (one extra model call)",
     )
     parser.add_argument(
         "--config",
@@ -199,7 +205,7 @@ def collect_candidate_inputs(args: argparse.Namespace) -> List[str]:
 
     # Feature 2: Smart ripgrep candidate auto-discovery
     if not candidates and args.query:
-        discovered = discover_candidate_files(args.query)
+        discovered = discover_candidate_files(args.query, extra_terms=getattr(args, "extra_terms", None))
         if discovered:
             if not args.json:
                 console.print(f"[dim]🔍 Auto-discovered {len(discovered)} candidate files via ripgrep...[/dim]")
@@ -231,6 +237,16 @@ def main() -> int:
             else:
                 error_console.print(f"[bold red]Error:[/bold red] {reason}")
             return 1
+
+    # Optional: ask the model for synonyms the query does not contain. Purely additive --
+    # expansion failures return no terms and auto-discovery proceeds unchanged.
+    args.extra_terms = []
+    if getattr(args, "expand", False) and args.query and args.base_url:
+        args.extra_terms = asyncio.run(
+            expand_query(args.query, base_url=args.base_url, model=args.model or "lfm")
+        )
+        if args.extra_terms and not args.json:
+            console.print(f"[dim]🧠 Expanded query with: {', '.join(args.extra_terms)}[/dim]")
 
     candidate_inputs = collect_candidate_inputs(args)
     if not candidate_inputs:

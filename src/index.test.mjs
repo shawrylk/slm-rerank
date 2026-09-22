@@ -19,6 +19,7 @@ import {
 } from "./discovery.mjs";
 import { handleMcpMessage } from "./mcp.mjs";
 import { Reranker } from "./client.mjs";
+import { expandQuery, formatExpansionPrompt, parseExpansionText } from "./expander.mjs";
 
 test("Two-Tier Filter: bypass under 60 candidates", () => {
   const chunks = Array.from({ length: 40 }, (_, i) => ({
@@ -186,6 +187,80 @@ test("Reranker: baseUrl falls back to any endpoint env var", () => {
   }
 });
 
+test("Expander: prompt carries the query and the reasoning bypass", () => {
+  const prompt = formatExpansionPrompt("interop harness");
+  assert.ok(prompt.includes("Query: interop harness"));
+  assert.ok(prompt.endsWith("<|im_start|>assistant\n<think>\n</think>\n"));
+});
+
+test("Expander: parsing drops prose, generic nouns and words already in the query", () => {
+  const terms = parseExpansionText(
+    "communication, protocol, the, code, function, interop, bridge, adapter, bridge",
+    "interop harness"
+  );
+  assert.ok(terms.includes("bridge"));
+  assert.ok(terms.includes("adapter"));
+  assert.ok(!terms.includes("the"), "stop word leaked through");
+  assert.ok(!terms.includes("code"), "generic noun leaked through");
+  assert.ok(!terms.includes("function"), "generic noun leaked through");
+  assert.ok(!terms.includes("interop"), "term already in the query was re-added");
+  assert.equal(terms.filter(t => t === "bridge").length, 1, "duplicate term");
+
+  assert.deepEqual(parseExpansionText("", "q"), []);
+  assert.deepEqual(parseExpansionText(null, "q"), []);
+});
+
+test("Expander: reads llama.cpp content and caps the term count", async () => {
+  const calls = [];
+  const fetchImpl = async (url, opts) => {
+    calls.push({ url, body: JSON.parse(opts.body) });
+    return { ok: true, json: async () => ({ content: "bridge, adapter, wrapper, connector, marshal" }) };
+  };
+
+  const terms = await expandQuery("interop harness", {
+    baseUrl: "http://127.0.0.1:8034/v1", useCache: false, maxTerms: 3, fetchImpl
+  });
+
+  assert.deepEqual(terms, ["bridge", "adapter", "wrapper"]);
+  assert.equal(calls[0].url, "http://127.0.0.1:8034/completion", "must use the native endpoint");
+  assert.equal(calls[0].body.temperature, 0, "greedy decoding keeps the cache meaningful");
+  assert.equal(calls[0].body.n_predict, 64);
+});
+
+test("Expander: every failure degrades to no terms, never an exception", async () => {
+  const reject = async () => { throw new Error("unreachable"); };
+  const notOk = async () => ({ ok: false, json: async () => ({}) });
+  const empty = async () => ({ ok: true, json: async () => ({}) });
+
+  assert.deepEqual(await expandQuery("q", { baseUrl: "http://x/v1", useCache: false, fetchImpl: reject }), []);
+  assert.deepEqual(await expandQuery("q", { baseUrl: "http://x/v1", useCache: false, fetchImpl: notOk }), []);
+  assert.deepEqual(await expandQuery("q", { baseUrl: "http://x/v1", useCache: false, fetchImpl: empty }), []);
+  assert.deepEqual(await expandQuery("q", { useCache: false, fetchImpl: reject }), [], "no baseUrl");
+  assert.deepEqual(await expandQuery("", { baseUrl: "http://x/v1", useCache: false, fetchImpl: reject }), []);
+});
+
+test("Discovery: an expanded term widens recall without outranking a literal hit", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "slm-expand-"));
+  try {
+    fs.mkdirSync(path.join(dir, "src"), { recursive: true });
+    fs.writeFileSync(path.join(dir, "src", "harness.ts"), "export const x = 1;\n");
+    fs.writeFileSync(path.join(dir, "src", "bridge.ts"), "export const y = 2;\n");
+    const git = (...args) => spawnSync("git", args, { cwd: dir, encoding: "utf-8" });
+    git("init", "-q", ".");
+    git("add", "-A");
+    git("-c", "user.email=t@example.com", "-c", "user.name=test", "commit", "-qm", "fixture");
+
+    const base = discoverCandidateFiles("harness", { cwd: dir });
+    assert.ok(!base.includes("src/bridge.ts"), "bridge.ts should not match literally");
+
+    const expanded = discoverCandidateFiles("harness", { cwd: dir, extraTerms: ["bridge"] });
+    assert.ok(expanded.includes("src/bridge.ts"), "expansion did not widen recall");
+    assert.equal(expanded[0], "src/harness.ts", "a synonym outranked the literal match");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("Discovery: query terms keep stems beside their roots", () => {
   const terms = extractQueryTerms("interop harness migration fixture");
   assert.deepEqual(terms, ["interop", "harness", "migration", "migrat", "migrate", "fixture"]);
@@ -270,7 +345,7 @@ test("MCP: initialize returns protocol version, server info and tool capability"
   assert.equal(res.jsonrpc, "2.0");
   assert.equal(res.id, 1);
   assert.equal(res.result.protocolVersion, "2024-11-05");
-  assert.deepEqual(res.result.serverInfo, { name: "slm-reranker", version: "0.6.6" });
+  assert.deepEqual(res.result.serverInfo, { name: "slm-reranker", version: "0.7.0" });
   assert.deepEqual(res.result.capabilities, { tools: {} });
 });
 
@@ -290,7 +365,7 @@ test("MCP: tools/list advertises rerank_codebase with its full parameter schema"
   assert.equal(tool.inputSchema.type, "object");
   assert.deepEqual(tool.inputSchema.required, ["query"]);
 
-  for (const param of ["query", "paths_or_globs", "threshold", "top_k", "stub", "dirty", "by_slice"]) {
+  for (const param of ["query", "paths_or_globs", "threshold", "top_k", "stub", "dirty", "by_slice", "expand"]) {
     assert.ok(tool.inputSchema.properties[param], `missing parameter: ${param}`);
   }
 });

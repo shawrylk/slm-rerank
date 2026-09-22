@@ -151,7 +151,9 @@ QUERY_STOP_WORDS = {
 }
 
 IGNORE_GLOBS = ["!node_modules", "!.git", "!dist", "!build", "!coverage", "!__pycache__", "!.venv"]
-MAX_SEARCH_TERMS = 6    # one rg invocation each, so this is the cost knob
+MAX_SEARCH_TERMS = 6           # one rg invocation each, so this is the cost knob
+MAX_EXPANDED_SEARCH_TERMS = 8  # model-suggested terms get a smaller search budget
+EXPANDED_TERM_WEIGHT = 0.5     # a synonym hit must never outrank a literal one
 PATH_HIT_WEIGHT = 2     # a term in the path is a stronger signal than one body mention
 TEST_FILE_FACTOR = 0.5  # tests restate domain vocabulary; rank them below implementations
 MIN_STEM_LENGTH = 4
@@ -307,7 +309,12 @@ def _find_body_matches(target_dir: Path, terms: List[str]) -> Dict[str, set]:
     return hits
 
 
-def discover_candidate_files(query: str, cwd: Optional[str] = None, limit: int = 60) -> List[str]:
+def discover_candidate_files(
+    query: str,
+    cwd: Optional[str] = None,
+    limit: int = 60,
+    extra_terms: Optional[List[str]] = None,
+) -> List[str]:
     """
     Smart candidate file discovery using ripgrep (rg) with git grep / git ls-files fallback.
 
@@ -317,14 +324,29 @@ def discover_candidate_files(query: str, cwd: Optional[str] = None, limit: int =
     asked for unreachable as soon as any other file mentioned the words -- which is
     precisely what test files do.
     """
-    terms = extract_query_terms(query)
-    if not terms:
+    base_terms = extract_query_terms(query)
+    if not base_terms:
         return []
+
+    # Model-suggested terms (slm_rerank.expander) widen recall but are weighted down, so a
+    # synonym match can add a file without displacing one the query named literally.
+    weights: Dict[str, float] = {t: 1.0 for t in base_terms}
+    expanded: List[str] = []
+    for raw in extra_terms or []:
+        term = str(raw or "").lower().strip()
+        if not term or term in weights:
+            continue
+        weights[term] = EXPANDED_TERM_WEIGHT
+        expanded.append(term)
+    terms = base_terms + expanded
 
     target_dir = Path(cwd) if cwd else Path.cwd()
     repo_files = _list_repo_files(target_dir)
     # Path matching is in-memory, so every term is used; only content search is capped.
-    body_hits = _find_body_matches(target_dir, terms[:MAX_SEARCH_TERMS])
+    body_hits = _find_body_matches(
+        target_dir,
+        base_terms[:MAX_SEARCH_TERMS] + expanded[:MAX_EXPANDED_SEARCH_TERMS],
+    )
 
     scored: Dict[str, Dict[str, set]] = {}
 
@@ -344,7 +366,10 @@ def discover_candidate_files(query: str, cwd: Optional[str] = None, limit: int =
     for file_path, hit in scored.items():
         if not hit["path"] and not hit["body"]:
             continue
-        score = PATH_HIT_WEIGHT * len(hit["path"]) + len(hit["body"])
+        def weigh(matched: set) -> float:
+            return sum(weights.get(term, 1.0) for term in matched)
+
+        score = PATH_HIT_WEIGHT * weigh(hit["path"]) + weigh(hit["body"])
         if is_test_path(file_path):
             score *= TEST_FILE_FACTOR
         ranked.append((score, file_path.count("/"), file_path))

@@ -68,23 +68,31 @@ function scanYesNo(entries) {
   return { yesLp, noLp };
 }
 
+/**
+ * llama.cpp serves native scoring on /completion at the server root, while the
+ * OpenAI-compatible shim lives under /v1 — resolve both from whatever was supplied.
+ */
+export function resolveCompletionUrls(baseUrl) {
+  const root = baseUrl.replace(/\/+$/, "");
+  if (root.endsWith("/v1")) {
+    return { completionUrl: `${root.slice(0, -3)}/completion`, chatUrl: `${root}/chat/completions` };
+  }
+  if (root.endsWith("/completion")) {
+    return {
+      completionUrl: root,
+      chatUrl: `${root.replace(/\/completion$/, "")}/v1/chat/completions`
+    };
+  }
+  return { completionUrl: `${root}/completion`, chatUrl: `${root}/v1/chat/completions` };
+}
+
 export class Reranker {
   constructor(options = {}) {
     this.baseUrl = (options.baseUrl || resolveEndpointEnv() || "http://localhost:8034/v1").replace(/\/+$/, "");
 
-    // llama.cpp serves native scoring on /completion at the server root, while the
-    // OpenAI-compatible shim lives under /v1 — resolve both from whatever was supplied.
-    if (this.baseUrl.endsWith("/v1")) {
-      const root = this.baseUrl.slice(0, -3);
-      this.completionUrl = `${root}/completion`;
-      this.chatUrl = `${this.baseUrl}/chat/completions`;
-    } else if (this.baseUrl.endsWith("/completion")) {
-      this.completionUrl = this.baseUrl;
-      this.chatUrl = `${this.baseUrl.replace(/\/completion$/, "")}/v1/chat/completions`;
-    } else {
-      this.completionUrl = `${this.baseUrl}/completion`;
-      this.chatUrl = `${this.baseUrl}/v1/chat/completions`;
-    }
+    const { completionUrl, chatUrl } = resolveCompletionUrls(this.baseUrl);
+    this.completionUrl = completionUrl;
+    this.chatUrl = chatUrl;
 
     this.model = options.model || "lfm";
     this.concurrency = options.concurrency || 4;

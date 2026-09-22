@@ -4,7 +4,17 @@ export { chunkFile, prepareCandidates } from "./chunker.mjs";
 export { stitchChunkContext } from "./stitcher.mjs";
 export { generateGhostStub } from "./stubber.mjs";
 export { detectSlice, groupBySlice } from "./boundary.mjs";
-export { autoDiscoverEndpoint, discoverCandidateFiles, probePort, SLM_PORT_RANGE } from "./discovery.mjs";
+export {
+  autoDiscoverEndpoint,
+  discoverCandidateFiles,
+  extractQueryTerms,
+  isTestPath,
+  probePort,
+  resolveEndpointEnv,
+  resolveHostEnv,
+  SLM_PORT_RANGE
+} from "./discovery.mjs";
+export { expandQuery, formatExpansionPrompt, parseExpansionText } from "./expander.mjs";
 export { startMcpServer, handleMcpMessage } from "./mcp.mjs";
 
-export const VERSION = "0.6.6";
+export const VERSION = "0.7.0";

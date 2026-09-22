@@ -19,7 +19,8 @@ import httpx
 from mcp.server.mcpserver import MCPServer
 
 from slm_rerank import LFMReranker, QueryIntent
-from slm_rerank.discovery import resolve_endpoint_env, resolve_host_env
+from slm_rerank.discovery import discover_candidate_files, resolve_endpoint_env, resolve_host_env
+from slm_rerank.expander import expand_query
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
@@ -110,6 +111,7 @@ async def rerank_codebase(
     intent: str = "IMPLEMENTATION",
     model: str = "lfm",
     base_url: str = DEFAULT_BASE_URL,
+    expand: bool = False,
 ) -> Dict[str, Any]:
     """Semantically rerank codebase files and AST chunks against a query using local SLM.
 
@@ -124,12 +126,20 @@ async def rerank_codebase(
         intent: Search intent: 'IMPLEMENTATION', 'SPECIFICATION', 'BUG_DIAGNOSIS', 'REFACTOR'.
         model: SLM model identifier ('lfm', 'qwen', 'gemma', 'rwkv', 'openai').
         base_url: Local model server endpoint (default: 'http://localhost:8034/v1').
+        expand: Ask the local model for synonyms before auto-discovering candidates.
+            Helps when the code uses different vocabulary than the query (e.g. "harness"
+            vs "bridge"). Only applies when paths_or_globs is empty; costs one model call.
 
     Returns:
         Structured rerank response containing top results with exact line citations, symbols,
         confidence scores, and token reduction statistics.
     """
     candidate_files = resolve_candidate_paths(paths_or_globs)
+    if not candidate_files and not paths_or_globs:
+        # No patterns given at all: fall back to auto-discovery, optionally widened by
+        # the model. A pattern that simply matched nothing still reports that, below.
+        extra_terms = await expand_query(query, base_url=base_url, model=model) if expand else []
+        candidate_files = discover_candidate_files(query, extra_terms=extra_terms)
     if not candidate_files:
         return {
             "error": "No matching files found for candidate patterns.",

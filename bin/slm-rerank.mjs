@@ -7,6 +7,7 @@ import { Reranker } from "../src/client.mjs";
 import { prepareCandidates } from "../src/chunker.mjs";
 import { autoDiscoverEndpoint, discoverCandidateFiles, resolveHostEnv } from "../src/discovery.mjs";
 import { groupBySlice } from "../src/boundary.mjs";
+import { expandQuery } from "../src/expander.mjs";
 import { startMcpServer } from "../src/mcp.mjs";
 
 const options = {
@@ -23,6 +24,7 @@ const options = {
   dirty: { type: "boolean", default: false },
   "git-diff": { type: "boolean", default: false },
   "by-slice": { type: "boolean", default: false },
+  expand: { type: "boolean", default: false },
   json: { type: "boolean", default: false },
   mcp: { type: "boolean", default: false },
   help: { type: "boolean", short: "h" }
@@ -43,6 +45,8 @@ Options:
       --dirty              Bias or filter by git uncommitted/modified files
       --git-diff           Boost candidates recently touched in git history
       --by-slice           Group results by architectural vertical slice
+      --expand             Ask the local model for extra search terms before
+                           auto-discovery (opt-in; one extra model call)
       --full               Force full GPU evaluation (bypass Tier-1 filter)
       --with-context       Stitch 1-hop type and call context (<= 150 tokens)
       --json               Output raw JSON
@@ -170,8 +174,29 @@ async function main() {
 
   let files = parsed.positionals;
   if (!files.length) {
+    // Optional: ask the model for synonyms the query does not contain. Resolve the
+    // endpoint here and hand it to runNative, so we only probe for a server once.
+    let extraTerms = [];
+    if (parsed.values.expand) {
+      let baseUrl = parsed.values["base-url"];
+      if (!baseUrl) {
+        const discovered = await autoDiscoverEndpoint({
+          host: parsed.values.host || resolveHostEnv(),
+          requestedModel: parsed.values.model || null
+        });
+        baseUrl = discovered.url;
+        if (baseUrl) parsed.values["base-url"] = baseUrl;
+      }
+      if (baseUrl) {
+        extraTerms = await expandQuery(query, { baseUrl, model: parsed.values.model || "lfm" });
+        if (extraTerms.length && !parsed.values.json) {
+          console.log(`🧠 Expanded query with: ${extraTerms.join(", ")}`);
+        }
+      }
+    }
+
     // Feature: Smart auto-discovery via ripgrep/git
-    files = discoverCandidateFiles(query);
+    files = discoverCandidateFiles(query, { extraTerms });
     if (!files.length) {
       console.error("Error: No relevant candidate files found automatically. Please specify file paths.");
       process.exit(1);

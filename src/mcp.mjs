@@ -12,11 +12,12 @@ import path from "node:path";
 import { Reranker } from "./client.mjs";
 import { prepareCandidates } from "./chunker.mjs";
 import { autoDiscoverEndpoint, discoverCandidateFiles, resolveHostEnv, SLM_PORT_RANGE } from "./discovery.mjs";
+import { expandQuery } from "./expander.mjs";
 import { groupBySlice } from "./boundary.mjs";
 
 export const MCP_PROTOCOL_VERSION = "2024-11-05";
 export const MCP_SERVER_NAME = "slm-reranker";
-export const MCP_SERVER_VERSION = "0.6.6";
+export const MCP_SERVER_VERSION = "0.7.0";
 
 const IGNORE_DIRS = new Set([
   ".git", "node_modules", "dist", "build", ".cache", ".next", "__pycache__",
@@ -69,6 +70,11 @@ export const RERANK_TOOL = {
       by_slice: {
         type: "boolean",
         description: "Group results by architectural vertical slice instead of a flat ranking.",
+        default: false
+      },
+      expand: {
+        type: "boolean",
+        description: "Ask the local model for synonyms before auto-discovering candidates. Helps when the code uses different vocabulary than the query (e.g. \"harness\" vs \"bridge\"). Ignored when paths_or_globs is given. Costs one extra model call.",
         default: false
       }
     },
@@ -298,10 +304,22 @@ async function callRerankTool(args = {}, context = {}) {
     ? args.paths_or_globs
     : (typeof args.paths_or_globs === "string" ? [args.paths_or_globs] : []);
 
+  // Resolve the endpoint first: expansion needs it, and failing here beats
+  // discovering files only to find there is nothing to score them with.
+  const endpoint = await discover({ host, ports: context.ports || SLM_PORT_RANGE });
+  if (!endpoint || !endpoint.url) {
+    return textResult(endpoint?.reason || `No SLM model server found on ${host}.`, true);
+  }
+
   let files = resolvePaths(patterns, { cwd });
   let autoDiscovered = false;
+  let expandedTerms = [];
   if (!files.length) {
-    files = discoverFiles(query, { cwd });
+    if (args.expand === true) {
+      const expand = context.expandQuery || expandQuery;
+      expandedTerms = await expand(query, { baseUrl: endpoint.url, model: context.model || "lfm" });
+    }
+    files = discoverFiles(query, { cwd, extraTerms: expandedTerms });
     autoDiscovered = true;
   }
   if (!files.length) {
@@ -316,10 +334,6 @@ async function callRerankTool(args = {}, context = {}) {
     return textResult(`No readable code chunks found across ${files.length} candidate file(s).`, true);
   }
 
-  const endpoint = await discover({ host, ports: context.ports || SLM_PORT_RANGE });
-  if (!endpoint || !endpoint.url) {
-    return textResult(endpoint?.reason || `No SLM model server found on ${host}.`, true);
-  }
 
   const reranker = new RerankerImpl({ baseUrl: endpoint.url, model: context.model || "lfm", threshold });
   const result = await reranker.rerank(query, chunks, {

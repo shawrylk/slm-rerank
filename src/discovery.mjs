@@ -128,14 +128,16 @@ export async function autoDiscoverEndpoint({
  */
 const CODE_EXTS = new Set([".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".rs", ".go", ".c", ".cpp", ".h"]);
 
-const QUERY_STOP_WORDS = new Set([
+export const QUERY_STOP_WORDS = new Set([
   "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "of", "for",
   "with", "from", "into", "by", "as", "is", "are", "was", "were", "be",
   "code", "file", "function", "method", "class", "find", "search", "how", "what", "where"
 ]);
 
 const IGNORE_GLOBS = ["!node_modules", "!.git", "!dist", "!build", "!coverage", "!__pycache__", "!.venv"];
-const MAX_SEARCH_TERMS = 6;   // one rg spawn each, so this is the cost knob
+const MAX_SEARCH_TERMS = 6;          // one rg spawn each, so this is the cost knob
+const MAX_EXPANDED_SEARCH_TERMS = 8; // model-suggested terms get a smaller search budget
+const EXPANDED_TERM_WEIGHT = 0.5;    // a synonym hit must never outrank a literal one
 const PATH_HIT_WEIGHT = 2;    // a term in the path is a stronger signal than one body mention
 const TEST_FILE_FACTOR = 0.5; // tests restate domain vocabulary; rank them below implementations
 const MIN_STEM_LENGTH = 4;
@@ -268,13 +270,28 @@ function findBodyMatches(cwd, terms) {
   return hits;
 }
 
-export function discoverCandidateFiles(query, { cwd = process.cwd(), limit = 60 } = {}) {
-  const terms = extractQueryTerms(query);
-  if (!terms.length) return [];
+export function discoverCandidateFiles(query, { cwd = process.cwd(), limit = 60, extraTerms = [] } = {}) {
+  const baseTerms = extractQueryTerms(query);
+  if (!baseTerms.length) return [];
+
+  // Model-suggested terms (src/expander.mjs) widen recall but are weighted down, so a
+  // synonym match can add a file without displacing one the query named literally.
+  const weights = new Map(baseTerms.map(t => [t, 1]));
+  const expanded = [];
+  for (const raw of extraTerms) {
+    const term = String(raw || "").toLowerCase().trim();
+    if (!term || weights.has(term)) continue;
+    weights.set(term, EXPANDED_TERM_WEIGHT);
+    expanded.push(term);
+  }
+  const terms = [...baseTerms, ...expanded];
 
   const repoFiles = listRepoFiles(cwd);
   // Path matching is in-memory, so every term is used; only content search is capped.
-  const bodyHits = findBodyMatches(cwd, terms.slice(0, MAX_SEARCH_TERMS));
+  const bodyHits = findBodyMatches(cwd, [
+    ...baseTerms.slice(0, MAX_SEARCH_TERMS),
+    ...expanded.slice(0, MAX_EXPANDED_SEARCH_TERMS)
+  ]);
 
   const scored = new Map();
   const entryFor = file => {
@@ -296,7 +313,8 @@ export function discoverCandidateFiles(query, { cwd = process.cwd(), limit = 60 
   const ranked = [];
   for (const [file, hit] of scored) {
     if (!hit.pathTerms.size && !hit.bodyTerms.size) continue;
-    let score = PATH_HIT_WEIGHT * hit.pathTerms.size + hit.bodyTerms.size;
+    const weigh = set => [...set].reduce((sum, term) => sum + (weights.get(term) ?? 1), 0);
+    let score = PATH_HIT_WEIGHT * weigh(hit.pathTerms) + weigh(hit.bodyTerms);
     if (isTestPath(file)) score *= TEST_FILE_FACTOR;
     ranked.push({ file, score, depth: file.split("/").length });
   }

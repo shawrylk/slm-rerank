@@ -115,6 +115,51 @@ ports 8033–8040 and returns ranked `file:line` citations plus a JSON candidate
 | `stub` | boolean | `false` | Attach AST Ghost Stubs to top results |
 | `dirty` | boolean | `false` | Bias toward git uncommitted/modified files |
 | `by_slice` | boolean | `false` | Group results by architectural vertical slice |
+| `expand` | boolean | `false` | Ask the model for synonyms before auto-discovery (see below) |
+
+---
+
+## Query Expansion (opt-in, `--expand`)
+
+Deterministic recall matches words and their stems. It reaches `migrate` from `migration`,
+but it will never reach `bridge` from `harness` — and a file whose code says `buildBridge`
+is invisible to a query that says "interop harness".
+
+`--expand` (CLI) or `"expand": true` (MCP) asks the local model for the vocabulary the query
+is missing, then feeds those terms into candidate discovery alongside the literal ones:
+
+```bash
+slm-rerank --query "interop harness" --expand
+# 🧠 Expanded query with: communication, protocol, serialization, wrapper, bridge, adapter, ...
+# → finds src/zz-adapter.ts, whose body says buildBridge and marshalRow
+```
+
+It is **strictly additive and strictly optional**:
+
+- Expanded terms are weighted at half a literal term, so a synonym can add a file to the
+  candidate set but never displace one the query named outright.
+- Every failure — no server, timeout, malformed answer — returns no terms, and recall
+  proceeds on the deterministic list. Expansion can widen recall; it can't break it.
+- Decoding is greedy (`temperature: 0`), so a query always yields the same terms. Results
+  are cached for 30 days in `~/.cache/slm-rerank/expansions.json`, shared between the Node
+  and Python implementations.
+
+### Measured effect
+
+On ten queries against this repository where the deterministic path already finds the
+target file: **1 improved, 9 unchanged, 0 worse**. Expansion is not a general win — it is a
+rescue for vocabulary mismatch. On a fixture repo where the target shares no words with the
+query, the same query goes from **not found at all** to **rank #1**:
+
+| Query | Target | Without `--expand` | With `--expand` |
+| --- | --- | --- | --- |
+| `interop harness` | `src/zz-adapter.ts` (`buildBridge`) | missing | **#1** |
+
+Cost is one model call, roughly 280ms on an 8B LFM, plus a few extra searches (~40ms).
+
+**Known limitation:** the model sometimes answers with prose or reads a word differently than
+you meant ("harness" as *test* harness). Generic and stop words are filtered out, and the
+half-weight keeps the rest from doing damage, but expansion quality is bounded by the model.
 
 ---
 
