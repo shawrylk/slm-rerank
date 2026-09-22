@@ -6,6 +6,7 @@ import { stitchChunkContext } from "./stitcher.mjs";
 import { generateGhostStub } from "./stubber.mjs";
 import { detectSlice, groupBySlice } from "./boundary.mjs";
 import { autoDiscoverEndpoint, discoverCandidateFiles } from "./discovery.mjs";
+import { handleMcpMessage } from "./mcp.mjs";
 
 test("Two-Tier Filter: bypass under 60 candidates", () => {
   const chunks = Array.from({ length: 40 }, (_, i) => ({
@@ -136,4 +137,103 @@ test("Discovery: ripgrep file discovery extracts valid files", () => {
   const files = discoverCandidateFiles("chunker and symbols");
   assert.ok(Array.isArray(files));
   assert.ok(files.length > 0);
+});
+
+test("MCP: initialize returns protocol version, server info and tool capability", async () => {
+  const res = await handleMcpMessage({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "initialize",
+    params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "test", version: "0" } }
+  });
+
+  assert.equal(res.jsonrpc, "2.0");
+  assert.equal(res.id, 1);
+  assert.equal(res.result.protocolVersion, "2024-11-05");
+  assert.deepEqual(res.result.serverInfo, { name: "slm-reranker", version: "0.6.2" });
+  assert.deepEqual(res.result.capabilities, { tools: {} });
+});
+
+test("MCP: notifications/initialized is acknowledged without a response", async () => {
+  const res = await handleMcpMessage({ jsonrpc: "2.0", method: "notifications/initialized" });
+  assert.equal(res, null);
+});
+
+test("MCP: tools/list advertises rerank_codebase with its full parameter schema", async () => {
+  const res = await handleMcpMessage({ jsonrpc: "2.0", id: 2, method: "tools/list" });
+
+  assert.equal(res.id, 2);
+  assert.equal(res.result.tools.length, 1);
+
+  const tool = res.result.tools[0];
+  assert.equal(tool.name, "rerank_codebase");
+  assert.equal(tool.inputSchema.type, "object");
+  assert.deepEqual(tool.inputSchema.required, ["query"]);
+
+  for (const param of ["query", "paths_or_globs", "threshold", "top_k", "stub", "dirty", "by_slice"]) {
+    assert.ok(tool.inputSchema.properties[param], `missing parameter: ${param}`);
+  }
+});
+
+test("MCP: ping returns an empty result", async () => {
+  const res = await handleMcpMessage({ jsonrpc: "2.0", id: 3, method: "ping" });
+  assert.equal(res.id, 3);
+  assert.deepEqual(res.result, {});
+});
+
+test("MCP: unknown method yields JSON-RPC method-not-found error", async () => {
+  const res = await handleMcpMessage({ jsonrpc: "2.0", id: 4, method: "resources/list" });
+  assert.equal(res.error.code, -32601);
+});
+
+test("MCP: tools/call reranks injected candidates and returns a manifest", async () => {
+  class FakeReranker {
+    constructor(opts) { this.opts = opts; }
+    async rerank(query, chunks) {
+      return {
+        query,
+        results: chunks.map((chunk, i) => ({ score: 0.9 - i * 0.1, chunk, slice: "core" })),
+        bySlice: {},
+        totalEvaluated: chunks.length,
+        tier1Applied: false,
+        filterReason: "bypass"
+      };
+    }
+  }
+
+  const res = await handleMcpMessage(
+    {
+      jsonrpc: "2.0",
+      id: 5,
+      method: "tools/call",
+      params: { name: "rerank_codebase", arguments: { query: "payment flow", paths_or_globs: ["x.ts"], top_k: 1 } }
+    },
+    {
+      Reranker: FakeReranker,
+      resolveCandidatePaths: () => ["x.ts"],
+      prepareCandidates: () => [
+        { id: "x.ts:1-4", filePath: "x.ts", startLine: 1, endLine: 4, symbol: "charge", content: "charge()" }
+      ],
+      autoDiscoverEndpoint: async () => ({ url: "http://127.0.0.1:8034/v1", port: 8034, modelId: "mock-lfm" })
+    }
+  );
+
+  assert.equal(res.result.isError, false);
+  assert.equal(res.result.content.length, 2);
+  assert.ok(res.result.content[0].text.includes("x.ts:1-4"));
+
+  const manifest = JSON.parse(res.result.content[1].text.replace("Candidate manifest (JSON):\n", ""));
+  assert.equal(manifest.candidates.length, 1);
+  assert.equal(manifest.candidates[0].file, "x.ts");
+  assert.equal(manifest.endpoint.port, 8034);
+});
+
+test("MCP: tools/call without a query returns invalid-params", async () => {
+  const res = await handleMcpMessage({
+    jsonrpc: "2.0",
+    id: 6,
+    method: "tools/call",
+    params: { name: "rerank_codebase", arguments: {} }
+  });
+  assert.equal(res.error.code, -32602);
 });

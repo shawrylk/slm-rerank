@@ -7,6 +7,7 @@ import { Reranker } from "../src/client.mjs";
 import { prepareCandidates } from "../src/chunker.mjs";
 import { autoDiscoverEndpoint, discoverCandidateFiles } from "../src/discovery.mjs";
 import { groupBySlice } from "../src/boundary.mjs";
+import { startMcpServer } from "../src/mcp.mjs";
 
 const options = {
   query: { type: "string", short: "q" },
@@ -23,6 +24,7 @@ const options = {
   "git-diff": { type: "boolean", default: false },
   "by-slice": { type: "boolean", default: false },
   json: { type: "boolean", default: false },
+  mcp: { type: "boolean", default: false },
   help: { type: "boolean", short: "h" }
 };
 
@@ -44,6 +46,7 @@ Options:
       --full               Force full GPU evaluation (bypass Tier-1 filter)
       --with-context       Stitch 1-hop type and call context (<= 150 tokens)
       --json               Output raw JSON
+      --mcp                Run as an MCP (Model Context Protocol) stdio server
   -h, --help               Show help
 
 Note: If no files or globs are passed, slm-rerank automatically runs smart
@@ -146,6 +149,12 @@ async function main() {
   if (parsed.values.help) {
     printHelp();
     process.exit(0);
+  }
+
+  // MCP stdio mode: stdout is reserved for JSON-RPC framing, so never log there.
+  if (parsed.values.mcp) {
+    startMcpServer({ host: parsed.values.host });
+    return;
   }
 
   const query = parsed.values.query;

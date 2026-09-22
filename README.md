@@ -73,6 +73,37 @@ pip install -e . --break-system-packages
 
 ---
 
+## MCP Server (Claude Code & other MCP clients)
+
+`slm-rerank` ships a zero-dependency, pure Node.js MCP server speaking JSON-RPC 2.0 over
+stdio — no Python, no `mcp` SDK, no PyTorch required.
+
+```bash
+# Run the server directly (stdin/stdout JSON-RPC)
+npx slm-rerank --mcp
+
+# Register it with Claude Code
+claude mcp add slm-reranker -- npx -y slm-rerank --mcp
+
+# Point it at a remote LAN GPU box
+claude mcp add slm-reranker -- npx -y slm-rerank --mcp --host 192.168.1.50
+```
+
+It exposes one tool, `rerank_codebase`, which auto-discovers a live SLM endpoint across
+ports 8033–8040 and returns ranked `file:line` citations plus a JSON candidate manifest:
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `query` | string | *(required)* | Natural language query or code task |
+| `paths_or_globs` | string[] | auto-discovery | Files, directories or globs (e.g. `["src/**/*.ts"]`) |
+| `threshold` | number | `0.65` | Relevance score cutoff |
+| `top_k` | integer | `5` | Maximum results returned |
+| `stub` | boolean | `false` | Attach AST Ghost Stubs to top results |
+| `dirty` | boolean | `false` | Bias toward git uncommitted/modified files |
+| `by_slice` | boolean | `false` | Group results by architectural vertical slice |
+
+---
+
 ## CLI Usage
 
 ### Model Selection & Auto-Detection
