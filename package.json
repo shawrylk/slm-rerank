@@ -1,0 +1,51 @@
+{
+  "name": "slm-rerank",
+  "version": "0.5.0",
+  "type": "module",
+  "description": "Model-Agnostic Semantic Wide Reranker with 1-Token Logprob Scoring & AST Chunking",
+  "license": "MIT",
+  "author": "shawrylk",
+  "homepage": "https://github.com/shawrylk/slm-rerank#readme",
+  "bugs": {
+    "url": "https://github.com/shawrylk/slm-rerank/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shawrylk/slm-rerank.git"
+  },
+  "keywords": [
+    "reranker",
+    "slm",
+    "semantic-search",
+    "code-search",
+    "lfm",
+    "qwen",
+    "logprobs",
+    "mcp",
+    "claude-code",
+    "ai-agents"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "bin": {
+    "slm-rerank": "./bin/slm-rerank.mjs"
+  },
+  "exports": {
+    ".": "./src/index.mjs",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "bin",
+    "src",
+    "README.md",
+    "hook_reranker.py",
+    "mcp_server.py"
+  ],
+  "scripts": {
+    "test": "node --test \"src/**/*.test.mjs\""
+  }
+}

@@ -1,0 +1,38 @@
+name: release
+
+# Automated release with npm Trusted Publishing (OIDC) & provenance
+# Triggered on git tag 'v*' or manual workflow_dispatch
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          registry-url: "https://registry.npmjs.org"
+
+      # Run Node test suite
+      - run: npm test
+
+      # The tag and the manifest must agree
+      - name: Verify tag matches package version
+        run: |
+          set -euo pipefail
+          tagged="${GITHUB_REF_NAME#v}"
+          packaged=$(node -p "require('./package.json').version")
+          [ "$tagged" = "$packaged" ] || { echo "tag $tagged != package $packaged"; exit 1; }
+
+      # Trusted publishing: the registry trusts this repository and workflow via OIDC
+      - run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
