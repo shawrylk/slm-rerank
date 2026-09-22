@@ -32,7 +32,7 @@
     "access": "public"
   },
   "bin": {
-    "slm-rerank": "./bin/slm-rerank.mjs"
+    "slm-rerank": "bin/slm-rerank.mjs"
   },
   "exports": {
     ".": "./src/index.mjs",
