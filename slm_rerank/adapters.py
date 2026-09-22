@@ -269,7 +269,7 @@ class ModelProfile:
     prompt_version: str = "v1"
     default_base_url: str = "http://localhost:8034/v1"
     length_normalization_exponent: float = 0.12
-    stop_tokens: List[str] = ["\n"]
+    stop_tokens: List[str] = []
 
     def __init__(
         self,
@@ -500,7 +500,7 @@ class LFMProfile(ModelProfile):
     name: str = "lfm"
     default_base_url: str = "http://localhost:8034/v1"
     length_normalization_exponent: float = 0.15
-    stop_tokens: List[str] = ["<|im_end|>", "\n", "<think>"]
+    stop_tokens: List[str] = ["<|im_end|>", "<think>"]
 
     def format_prompt(
         self,
@@ -545,7 +545,7 @@ class LFMProfile(ModelProfile):
             f"{test_guidance}"
             "Code:\n"
             f"{chunk_content}\n\n"
-            "Does this snippet contain the relevant code for the query? Answer (yes/no):"
+            "Does this snippet contain the relevant code for the query? Respond only with yes or no."
             "<|im_end|>\n"
             "<|im_start|>assistant\n"
             "<think>\n"
@@ -559,7 +559,7 @@ class QwenProfile(ModelProfile):
     name: str = "qwen"
     default_base_url: str = "http://localhost:8033/v1"
     length_normalization_exponent: float = 0.12
-    stop_tokens: List[str] = ["<|im_end|>", "\n"]
+    stop_tokens: List[str] = ["<|im_end|>"]
 
     def __init__(
         self,
@@ -625,7 +625,7 @@ class GemmaProfile(ModelProfile):
     name: str = "gemma"
     default_base_url: str = "http://localhost:11434/v1"
     length_normalization_exponent: float = 0.12
-    stop_tokens: List[str] = ["<end_of_turn>", "\n"]
+    stop_tokens: List[str] = ["<end_of_turn>"]
 
     def format_prompt(
         self,
@@ -679,7 +679,7 @@ class RWKVProfile(ModelProfile):
     name: str = "rwkv"
     default_base_url: str = "http://localhost:8000/v1"
     length_normalization_exponent: float = 0.10
-    stop_tokens: List[str] = ["\n\n", "\n", "User:"]
+    stop_tokens: List[str] = ["\n\n", "User:"]
 
     def format_prompt(
         self,
@@ -732,7 +732,7 @@ class GenericOpenAIProfile(ModelProfile):
     name: str = "openai"
     default_base_url: str = "http://localhost:11434/v1"
     length_normalization_exponent: float = 0.12
-    stop_tokens: List[str] = ["<|im_end|>", "<end_of_turn>", "\n"]
+    stop_tokens: List[str] = ["<|im_end|>", "<end_of_turn>"]
 
     def format_prompt(
         self,

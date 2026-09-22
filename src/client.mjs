@@ -2,9 +2,89 @@
 import { detectSlice, groupBySlice } from "./boundary.mjs";
 import { generateGhostStub } from "./stubber.mjs";
 
+// Length-normalized sigmoid calibration (mirrors slm_rerank.adapters.ModelProfile.calibrate_score).
+const LENGTH_NORM_EXPONENT = 0.15;
+const LENGTH_NORM_REFERENCE = 120.0;
+const LENGTH_NORM_FLOOR = 40.0;
+const SINGLE_SIDED_LOGIT = 3.0;
+const NO_SIGNAL_SCORE = 0.05;
+const DEFAULT_TOKEN_EST = 100;
+
+const YES_TOKENS = new Set(["yes", "y", "true"]);
+const NO_TOKENS = new Set(["no", "n", "false"]);
+
+// Top-logprob containers, most specific first: llama.cpp /completion, OpenAI chat
+// completions, OpenAI legacy completions (per-position token->logprob map), bare payload.
+const LOGPROB_SOURCES = [
+  payload => payload?.completion_probabilities?.[0]?.top_logprobs,
+  payload => payload?.choices?.[0]?.logprobs?.content?.[0]?.top_logprobs,
+  payload => payload?.choices?.[0]?.logprobs?.top_logprobs?.[0],
+  payload => payload?.choices?.[0]?.logprobs?.top_logprobs,
+  payload => payload?.top_logprobs
+];
+
+function normalizeEntries(raw) {
+  if (!raw) return [];
+
+  if (Array.isArray(raw)) {
+    return raw
+      .filter(item => item && typeof item === "object")
+      .map(item => ({
+        token: typeof item.token === "string" ? item.token : typeof item.tok_str === "string" ? item.tok_str : "",
+        logprob:
+          typeof item.logprob === "number"
+            ? item.logprob
+            : typeof item.prob === "number"
+              ? Math.log(Math.max(item.prob, 1e-9))
+              : null
+      }))
+      .filter(entry => entry.logprob !== null);
+  }
+
+  if (typeof raw === "object") {
+    return Object.entries(raw)
+      .filter(([, logprob]) => typeof logprob === "number")
+      .map(([token, logprob]) => ({ token, logprob }));
+  }
+
+  return [];
+}
+
+function scanYesNo(entries) {
+  let yesLp = null;
+  let noLp = null;
+
+  for (const entry of entries) {
+    // Strip BPE/SentencePiece word-boundary markers before matching.
+    const token = entry.token.toLowerCase().trim().replace(/^[Ġ▁_\s]+/, "");
+    if (YES_TOKENS.has(token)) {
+      if (yesLp === null || entry.logprob > yesLp) yesLp = entry.logprob;
+    } else if (NO_TOKENS.has(token)) {
+      if (noLp === null || entry.logprob > noLp) noLp = entry.logprob;
+    }
+  }
+
+  return { yesLp, noLp };
+}
+
 export class Reranker {
   constructor(options = {}) {
-    this.baseUrl = options.baseUrl || process.env.SLM_ENDPOINT || "http://localhost:8034/v1";
+    this.baseUrl = (options.baseUrl || process.env.SLM_ENDPOINT || "http://localhost:8034/v1").replace(/\/+$/, "");
+
+    // llama.cpp serves native scoring on /completion at the server root, while the
+    // OpenAI-compatible shim lives under /v1 — resolve both from whatever was supplied.
+    if (this.baseUrl.endsWith("/v1")) {
+      const root = this.baseUrl.slice(0, -3);
+      this.completionUrl = `${root}/completion`;
+      this.chatUrl = `${this.baseUrl}/chat/completions`;
+    } else if (this.baseUrl.endsWith("/completion")) {
+      this.completionUrl = this.baseUrl;
+      this.chatUrl = `${this.baseUrl.replace(/\/completion$/, "")}/v1/chat/completions`;
+    } else {
+      this.completionUrl = `${this.baseUrl}/completion`;
+      this.chatUrl = `${this.baseUrl}/v1/chat/completions`;
+    }
+
     this.model = options.model || "lfm";
     this.concurrency = options.concurrency || 4;
     this.threshold = options.threshold ?? 0.65;
@@ -12,38 +92,47 @@ export class Reranker {
 
   formatPrompt(query, chunk, stitchedContext = "") {
     const contextPrefix = stitchedContext ? `${stitchedContext}\n` : "";
-    return `<|im_start|>user\nYou are an expert code search evaluator. Is the following code candidate relevant to the search query?\n\nQuery: ${query}\n\nFile: ${chunk.filePath || "unknown"}\nSymbol: ${chunk.symbol || "unknown"}\nLines: ${chunk.startLine}-${chunk.endLine}\n\nCandidate Code:\n${contextPrefix}${chunk.content}\n\nRespond with only 'Yes' or 'No'.<|im_end|>\n<|im_start|>assistant\n<think>\n</think>\n`;
+    const fileInfo = chunk.filePath ? `File: ${chunk.filePath}\n` : "";
+    let lineInfo = "";
+    if (chunk.filePath) {
+      lineInfo =
+        chunk.startLine != null && chunk.endLine != null
+          ? `Lines: ${chunk.startLine}-${chunk.endLine}\n`
+          : "Lines: 1-1\n";
+    }
+    const symInfo = chunk.symbol ? `Symbol: ${chunk.symbol}\n` : "";
+
+    return `<|startoftext|><|im_start|>system\nYou are a binary code retrieval evaluator. For the given search query and code snippet, evaluate if the snippet contains the relevant implementation, specification, definition, or answer requested.\nRespond with exactly "yes" if relevant, or "no" if not relevant.\n<|im_end|>\n<|im_start|>user\nQuery: ${query}\n\n${fileInfo}${lineInfo}${symInfo}Code:\n${contextPrefix}${chunk.content}\n\nDoes this snippet contain the relevant code for the query? Respond only with yes or no.<|im_end|>\n<|im_start|>assistant\n<think>\n</think>\n`;
   }
 
-  extractLogprobs(payload) {
+  calibrateScore(yesLp, noLp, chunk = {}) {
+    let rawLogit;
+    if (yesLp !== null && noLp === null) {
+      rawLogit = SINGLE_SIDED_LOGIT;
+    } else if (noLp !== null && yesLp === null) {
+      rawLogit = -SINGLE_SIDED_LOGIT;
+    } else if (yesLp !== null && noLp !== null) {
+      rawLogit = yesLp - noLp;
+    } else {
+      return NO_SIGNAL_SCORE;
+    }
+
+    const tokenEst = chunk?.content ? Math.ceil(chunk.content.length / 4) : DEFAULT_TOKEN_EST;
+    const effLength = Math.max(LENGTH_NORM_FLOOR, tokenEst);
+    const lengthScale = Math.pow(LENGTH_NORM_REFERENCE / effLength, LENGTH_NORM_EXPONENT);
+
+    return 1 / (1 + Math.exp(-(rawLogit * lengthScale)));
+  }
+
+  extractLogprobs(payload, chunk = {}) {
     try {
-      const choice = payload.choices?.[0];
-      const logprobsData = choice?.logprobs?.content?.[0] || choice?.logprobs?.top_logprobs?.[0];
-      const topLogprobs = logprobsData?.top_logprobs || [];
-
-      let yesLp = null;
-      let noLp = null;
-
-      for (const item of topLogprobs) {
-        const token = (item.token || "").toLowerCase().trim().replace(/^[Ġ_]/, "");
-        if (token === "yes" || token === "true" || token === "y") {
-          if (yesLp === null || item.logprob > yesLp) yesLp = item.logprob;
-        } else if (token === "no" || token === "false" || token === "n") {
-          if (noLp === null || item.logprob > noLp) noLp = item.logprob;
-        }
+      for (const pick of LOGPROB_SOURCES) {
+        const { yesLp, noLp } = scanYesNo(normalizeEntries(pick(payload)));
+        if (yesLp !== null || noLp !== null) return this.calibrateScore(yesLp, noLp, chunk);
       }
-
-      if (yesLp === null && noLp === null) {
-        return 0.5;
-      }
-      if (yesLp !== null && noLp === null) return 0.95;
-      if (yesLp === null && noLp !== null) return 0.05;
-
-      const pYes = Math.exp(yesLp);
-      const pNo = Math.exp(noLp);
-      return pYes / (pYes + pNo);
+      return NO_SIGNAL_SCORE;
     } catch {
-      return 0.5;
+      return NO_SIGNAL_SCORE;
     }
   }
 
@@ -57,36 +146,76 @@ export class Reranker {
 
     const prompt = this.formatPrompt(query, chunk, stitched);
 
+    let payload = null;
+    let lastError = null;
+
+    // Preferred path: llama.cpp native /completion returns completion_probabilities.
     try {
-      const resp = await fetch(`${this.baseUrl}/chat/completions`, {
+      const resp = await fetch(this.completionUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          model: this.model,
-          messages: [{ role: "user", content: prompt }],
-          max_tokens: 1,
+          prompt,
+          n_predict: 1,
+          n_probs: 10,
           temperature: 0.0,
-          logprobs: true,
-          top_logprobs: 10
+          stop: ["<|im_end|>"]
         })
       });
 
-      if (!resp.ok) {
-        return { chunk, score: 0.0, rawScore: 0.0, error: `HTTP ${resp.status}`, slice: detectSlice(chunk.filePath) };
+      if (resp.ok) {
+        payload = await resp.json();
+      } else {
+        lastError = `HTTP ${resp.status}`;
       }
+    } catch (err) {
+      lastError = err.message;
+    }
 
-      const data = await resp.json();
-      const rawScore = this.extractLogprobs(data);
+    // Fallback: OpenAI-compatible chat completions with top_logprobs.
+    if (payload === null) {
+      try {
+        const resp = await fetch(this.chatUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: this.model,
+            messages: [{ role: "user", content: prompt }],
+            max_tokens: 1,
+            temperature: 0.0,
+            logprobs: true,
+            top_logprobs: 10
+          })
+        });
 
+        if (resp.ok) {
+          payload = await resp.json();
+        } else {
+          lastError = `HTTP ${resp.status}`;
+        }
+      } catch (err) {
+        lastError = err.message;
+      }
+    }
+
+    if (payload === null) {
       return {
         chunk,
-        score: Math.round(rawScore * 10000) / 10000,
-        rawScore: Math.round(rawScore * 10000) / 10000,
+        score: 0.0,
+        rawScore: 0.0,
+        error: lastError || "no response",
         slice: detectSlice(chunk.filePath)
       };
-    } catch (err) {
-      return { chunk, score: 0.0, rawScore: 0.0, error: err.message, slice: detectSlice(chunk.filePath) };
     }
+
+    const rawScore = this.extractLogprobs(payload, chunk);
+
+    return {
+      chunk,
+      score: Math.round(rawScore * 10000) / 10000,
+      rawScore: Math.round(rawScore * 10000) / 10000,
+      slice: detectSlice(chunk.filePath)
+    };
   }
 
   async rerank(query, chunks, options = {}) {
