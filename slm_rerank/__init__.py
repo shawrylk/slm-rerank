@@ -1,6 +1,10 @@
 """Model-Agnostic Wide Reranker with 1-Token Logprob Scoring & AST Chunking."""
 
 from .adapters import (
+    GENERIC_QUERY_STOPWORDS,
+    PUBLIC_API_MARKERS,
+    SYMPTOM_MODIFIER_TERMS,
+    UTILITY_HELPER_VERBS,
     GenericOpenAIProfile,
     GemmaProfile,
     LFMProfile,
@@ -8,8 +12,14 @@ from .adapters import (
     ProviderAdapter,
     QwenProfile,
     RWKVProfile,
+    SymbolRole,
+    classify_symbol_role,
     detect_profile_from_model_names,
     get_profile,
+    lexical_terms,
+    normalize_term,
+    saturating_term_frequency,
+    split_symbol_components,
     probe_and_detect_profile_async,
     probe_and_detect_profile_sync,
     probe_tokenizer_tokens_sync,
@@ -27,14 +37,39 @@ from .calibration import (
     get_default_calibrator,
 )
 from .client import (
+    DomainAlignment,
     LFMReranker,
+    QueryDecomposition,
     Reranker,
     apply_diversity_context_assembly,
+    compute_domain_alignment,
     compute_symbol_match_delta,
+    compute_utility_trap_delta,
+    decompose_query,
+    enforce_domain_precedence,
     extract_binary_logprobs,
     extract_calibrated_logprobs,
     extract_code_identifiers,
     logsumexp,
+)
+from .filter import (
+    TIER1_BYPASS_MAX_CANDIDATES,
+    TIER1_SELECT_TOP_N,
+    Tier1Decision,
+    apply_two_tier_filter,
+    build_query_terms,
+    compute_lexical_score,
+)
+from .stitcher import (
+    MAX_STITCH_TOKENS,
+    Definition,
+    StitchedContext,
+    apply_context_stitching,
+    extract_called_identifiers,
+    extract_definitions,
+    find_callers,
+    find_enclosing_type,
+    stitch_chunk_context,
 )
 from .config import (
     get_default_config_path,
@@ -66,7 +101,7 @@ from .models import (
 )
 from .verifier import GroundTruthVerifier
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 __all__ = [
     "LFMReranker",
@@ -123,4 +158,38 @@ __all__ = [
     "compute_symbol_match_delta",
     "apply_diversity_context_assembly",
     "extract_code_identifiers",
+    # Two-Tier Hybrid Search (v0.5.0)
+    "TIER1_BYPASS_MAX_CANDIDATES",
+    "TIER1_SELECT_TOP_N",
+    "Tier1Decision",
+    "apply_two_tier_filter",
+    "build_query_terms",
+    "compute_lexical_score",
+    # Call-Graph & Type Context Stitching (v0.5.0)
+    "MAX_STITCH_TOKENS",
+    "Definition",
+    "StitchedContext",
+    "apply_context_stitching",
+    "extract_called_identifiers",
+    "extract_definitions",
+    "find_callers",
+    "find_enclosing_type",
+    "stitch_chunk_context",
+    # Utility Trap Resolution (v0.5.0)
+    "QueryDecomposition",
+    "DomainAlignment",
+    "SymbolRole",
+    "decompose_query",
+    "compute_domain_alignment",
+    "compute_utility_trap_delta",
+    "enforce_domain_precedence",
+    "classify_symbol_role",
+    "saturating_term_frequency",
+    "split_symbol_components",
+    "lexical_terms",
+    "normalize_term",
+    "SYMPTOM_MODIFIER_TERMS",
+    "GENERIC_QUERY_STOPWORDS",
+    "UTILITY_HELPER_VERBS",
+    "PUBLIC_API_MARKERS",
 ]

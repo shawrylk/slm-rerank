@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Type, Union
+import re
+from enum import Enum
+from typing import Any, Dict, FrozenSet, List, Optional, Sequence, Set, Tuple, Type, Union
 
 import httpx
 
@@ -16,6 +18,171 @@ LFM_NO_TOKEN_IDS = {2243, 4547, 794, 2752}        # 'no', 'No', ' no', ' No'
 
 YES_VARIANTS: Set[str] = {"yes", "true", "y", "1", "+1", "relevant", "match", "positive"}
 NO_VARIANTS: Set[str] = {"no", "false", "n", "0", "-1", "irrelevant", "negative"}
+
+
+# ==============================================================================
+# Semantic Vocabulary & Symbol Role Classification (v0.5.0)
+#
+# Shared lexical vocabulary used by the Tier-1 hybrid filter and by the
+# client-side "Utility Trap" resolution layer. Kept next to the other
+# model-facing vocabularies so every scoring stage decomposes a query the
+# same way.
+# ==============================================================================
+
+# Symptom modifiers describe *what went wrong*, never *what the code is about*.
+# A chunk that only matches these is describing the same failure vocabulary as
+# the query without implementing any of its domain.
+SYMPTOM_MODIFIER_TERMS: FrozenSet[str] = frozenset({
+    "crash", "crashes", "crashing", "exception", "exceptions", "error", "errors", "errno",
+    "bug", "bugs", "fail", "fails", "failed", "failing", "failure", "failures",
+    "syntax", "diagnose", "diagnosis", "diagnostic", "diagnostics", "debug", "debugging",
+    "issue", "issues", "trace", "traceback", "stacktrace", "backtrace",
+    "panic", "segfault", "abort", "broken", "regression", "regressions",
+    "leak", "leaks", "hang", "hangs", "deadlock", "timeout", "timeouts",
+    "warning", "warnings", "overflow", "underflow", "corrupt", "corruption",
+    "invalid", "malformed", "unexpected", "reproduce", "repro",
+})
+
+# Generic English filler plus task verbs and code meta-nouns. These carry no
+# domain signal of their own, so they are excluded from the core entity set.
+GENERIC_QUERY_STOPWORDS: FrozenSet[str] = frozenset({
+    "a", "an", "the", "and", "or", "but", "not", "in", "on", "at", "to", "of", "for",
+    "with", "from", "into", "by", "as", "is", "are", "was", "were", "be", "been",
+    "this", "that", "these", "those", "it", "its", "there", "here", "then", "than",
+    "how", "what", "where", "which", "who", "when", "why", "do", "does", "did", "done",
+    "can", "could", "should", "would", "may", "might", "must", "will", "shall",
+    "please", "any", "all", "some", "more", "most", "other", "only", "also", "very",
+    "code", "codes", "file", "files", "line", "lines", "snippet", "snippets",
+    "function", "functions", "method", "methods", "class", "classes", "symbol", "symbols",
+    "type", "types", "common",
+    "implement", "implements", "implementation", "refactor", "refactoring", "rename",
+    "extract", "move", "find", "search", "locate", "show", "add", "create", "write",
+    "update", "use", "using", "need", "needs", "want", "make", "get", "set", "look",
+})
+
+# Low-level verbs that head small, internal, mechanical helpers. A symbol whose
+# leading component is one of these is a utility unless the query names it.
+UTILITY_HELPER_VERBS: FrozenSet[str] = frozenset({
+    "parse", "decode", "encode", "print", "dump", "fmt", "hex", "utf8", "utf16", "utf32",
+    "next", "prev", "peek", "skip", "advance", "seek", "read", "write", "scan",
+    "cmp", "compare", "equal", "equals", "match", "escape", "unescape",
+    "trim", "strip", "split", "join", "concat", "copy", "clone", "dup",
+    "alloc", "free", "dealloc", "release", "retain", "zero", "clamp", "swap",
+    "to", "from", "is", "has", "as", "into", "str", "tostr", "atoi", "itoa",
+})
+
+# Textual evidence that a definition is part of a module's public surface.
+PUBLIC_API_MARKERS: Tuple[str, ...] = (
+    "export ", "export default", "export function", "export class", "export const",
+    "public ", "pub fn ", "pub struct ", "pub enum ", "pub trait ", "pub const ",
+    'extern "C"', "__declspec", "__attribute__((visibility", "_API ", "_EXPORT ",
+    "@public", "@Public", "@api",
+)
+
+# A helper is only "small" (and therefore demotable) below this many lines.
+UTILITY_HELPER_MAX_LINES: int = 60
+
+_WORD_RE = re.compile(r"[a-zA-Z0-9]+")
+_COMPONENT_SPLIT_RE = re.compile(r"[^a-zA-Z0-9]+|(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
+
+
+class SymbolRole(str, Enum):
+    """Architectural role of a chunk's symbol, used for centrality scoring."""
+
+    PUBLIC_API = "PUBLIC_API"
+    INTERNAL_HELPER = "INTERNAL_HELPER"
+    UNKNOWN = "UNKNOWN"
+
+
+def normalize_term(term: str) -> str:
+    """Lowercase a term and fold regular English plurals so 'templates' matches 'template'.
+
+    Deliberately conservative: only plural folding, never open-ended prefix
+    stemming, so that 'parser' never collapses onto 'parse'.
+    """
+    t = str(term).strip().lower()
+    if len(t) <= 3:
+        return t
+    if t.endswith("ies") and len(t) > 4:
+        return t[:-3] + "y"
+    if t.endswith("sses") or t.endswith("shes") or t.endswith("ches") or t.endswith("xes"):
+        return t[:-2]
+    if t.endswith("s") and not t.endswith("ss") and not t.endswith("us") and not t.endswith("is"):
+        return t[:-1]
+    return t
+
+
+def split_symbol_components(symbol: str) -> List[str]:
+    """Split an identifier into normalized lexical components (snake_case, camelCase, kebab, dots)."""
+    if not symbol:
+        return []
+    parts = [p for p in _COMPONENT_SPLIT_RE.split(symbol) if p]
+    return [normalize_term(p) for p in parts if p]
+
+
+def lexical_terms(text: str) -> List[str]:
+    """Extract normalized word tokens from free text (query, path, or code)."""
+    if not text:
+        return []
+    return [normalize_term(w) for w in _WORD_RE.findall(text)]
+
+
+def saturating_term_frequency(count: float, k: float = 1.2) -> float:
+    """BM25-style term-frequency saturation in [0, 1).
+
+    Repeated occurrences of the same keyword yield sharply diminishing returns,
+    which is what stops a small helper from out-scoring a domain owner purely by
+    repeating a query keyword.
+    """
+    c = max(0.0, float(count))
+    if c == 0.0:
+        return 0.0
+    k_eff = max(1e-6, float(k))
+    return c / (c + k_eff)
+
+
+def classify_symbol_role(
+    symbol: Optional[str],
+    content: str = "",
+    file_path: Optional[str] = None,
+    line_span: Optional[int] = None,
+) -> SymbolRole:
+    """Classify a chunk's symbol as public API surface, small internal helper, or unknown.
+
+    Ordering matters: explicit internal markers (leading underscore, `static`)
+    win over public markers, which in turn win over the utility-verb heuristic.
+    """
+    sym = (symbol or "").strip()
+    if not sym or sym == "module_scope":
+        return SymbolRole.UNKNOWN
+
+    span = line_span if line_span is not None else content.count("\n") + 1
+    is_small = span <= UTILITY_HELPER_MAX_LINES
+
+    if sym.startswith("_"):
+        return SymbolRole.INTERNAL_HELPER
+
+    if is_small and re.search(r"^[ \t]*static[ \t]+", content, re.MULTILINE):
+        return SymbolRole.INTERNAL_HELPER
+
+    if any(marker in content for marker in PUBLIC_API_MARKERS):
+        return SymbolRole.PUBLIC_API
+
+    components = split_symbol_components(sym)
+    if components and is_small and any(c in UTILITY_HELPER_VERBS for c in components[:3]):
+        return SymbolRole.INTERNAL_HELPER
+
+    # Module affinity: a symbol that carries its own module's name is that
+    # module's public surface (llama-chat.cpp -> llm_chat_apply_template).
+    if file_path and components:
+        stem = str(file_path).replace("\\", "/").rsplit("/", 1)[-1]
+        stem = stem.rsplit(".", 1)[0]
+        stem_components = {c for c in split_symbol_components(stem) if len(c) >= 3}
+        if stem_components and stem_components & set(components):
+            return SymbolRole.PUBLIC_API
+
+    return SymbolRole.UNKNOWN
+
 
 
 def clean_token_str(token: str) -> str:

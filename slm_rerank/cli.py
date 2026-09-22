@@ -118,6 +118,17 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Score threshold below which to return empty context when allow-empty is enabled (default: 0.20)",
     )
     parser.add_argument(
+        "--full",
+        action="store_true",
+        help="Force full Tier-2 GPU evaluation of every candidate, bypassing the Tier-1 lexical pre-filter",
+    )
+    parser.add_argument(
+        "--with-context",
+        dest="with_context",
+        action="store_true",
+        help="Stitch up to 150 tokens of 1-hop call-graph and type context into each scoring prompt",
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help="Output raw JSON instead of Rich table",
@@ -186,6 +197,8 @@ def main() -> int:
                 strict=args.strict,
                 allow_empty_if_low_confidence=args.allow_empty_if_low_confidence,
                 abstain_below=args.abstain_below,
+                full=args.full,
+                with_context=args.with_context,
             )
         )
     except KeyboardInterrupt:
