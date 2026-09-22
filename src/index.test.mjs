@@ -5,7 +5,18 @@ import { chunkFile } from "./chunker.mjs";
 import { stitchChunkContext } from "./stitcher.mjs";
 import { generateGhostStub } from "./stubber.mjs";
 import { detectSlice, groupBySlice } from "./boundary.mjs";
-import { autoDiscoverEndpoint, discoverCandidateFiles, resolveEndpointEnv, resolveHostEnv } from "./discovery.mjs";
+import { spawnSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import {
+  autoDiscoverEndpoint,
+  discoverCandidateFiles,
+  extractQueryTerms,
+  isTestPath,
+  resolveEndpointEnv,
+  resolveHostEnv
+} from "./discovery.mjs";
 import { handleMcpMessage } from "./mcp.mjs";
 import { Reranker } from "./client.mjs";
 
@@ -175,6 +186,73 @@ test("Reranker: baseUrl falls back to any endpoint env var", () => {
   }
 });
 
+test("Discovery: query terms keep stems beside their roots", () => {
+  const terms = extractQueryTerms("interop harness migration fixture");
+  assert.deepEqual(terms, ["interop", "harness", "migration", "migrat", "migrate", "fixture"]);
+
+  // stems must follow their own root, or a term cap severs them
+  assert.ok(terms.indexOf("migrat") > terms.indexOf("migration"));
+  assert.ok(terms.indexOf("fixture") > terms.indexOf("migrate"));
+
+  // -ss is not a plural, -es is
+  assert.deepEqual(extractQueryTerms("harness"), ["harness"]);
+  assert.deepEqual(extractQueryTerms("classes"), ["classes", "class"]);
+  assert.deepEqual(extractQueryTerms("exports"), ["exports", "export"]);
+  assert.deepEqual(extractQueryTerms("chunking"), ["chunking", "chunk"]);
+
+  // stop words only -> falls back to the first raw word
+  assert.deepEqual(extractQueryTerms("the and of"), ["the"]);
+  assert.deepEqual(extractQueryTerms(""), []);
+});
+
+test("Discovery: test paths are recognised, fixtures are not", () => {
+  assert.equal(isTestPath("tests/unit-1.test.ts"), true);
+  assert.equal(isTestPath("src/__tests__/thing.ts"), true);
+  assert.equal(isTestPath("tests/test_client.py"), true);
+  assert.equal(isTestPath("pkg/client_test.go"), true);
+  assert.equal(isTestPath("src/interop/migrate-fixture.ts"), false);
+  assert.equal(isTestPath("src/fixtures/rows.ts"), false);
+  assert.equal(isTestPath("src/latest.ts"), false);
+});
+
+test("Discovery: a filename match outranks tests that merely mention the words", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "slm-recall-"));
+  try {
+    fs.mkdirSync(path.join(dir, "src", "interop"), { recursive: true });
+    fs.mkdirSync(path.join(dir, "tests"), { recursive: true });
+    // the file that holds the harness: its name carries the vocabulary, its body does not
+    fs.writeFileSync(
+      path.join(dir, "src", "interop", "migrate-fixture.ts"),
+      "export function buildLegacyBridge(rows) { return rows.map(normalizeRow); }\n"
+    );
+    // tests that restate the query vocabulary over and over
+    for (let i = 1; i <= 5; i++) {
+      fs.writeFileSync(
+        path.join(dir, "tests", `unit-${i}.test.ts`),
+        'describe("interop harness", () => { it("runs the interop harness migration", () => {}); });\n'
+      );
+    }
+
+    // discovery shells out to rg or git; make the fixture tree visible to either
+    const git = (...args) => spawnSync("git", args, { cwd: dir, encoding: "utf-8" });
+    git("init", "-q", ".");
+    git("add", "-A");
+    git("-c", "user.email=t@example.com", "-c", "user.name=test", "commit", "-qm", "fixture");
+
+    for (const query of ["fixture", "interop fixture", "interop harness migration fixture"]) {
+      const files = discoverCandidateFiles(query, { cwd: dir });
+      const hit = files.find(f => f.includes("migrate-fixture"));
+      assert.ok(hit, `"${query}" lost the fixture file: ${files.join(", ") || "(none)"}`);
+      assert.ok(
+        files[0].includes("migrate-fixture"),
+        `"${query}" ranked ${files[0]} above the fixture file`
+      );
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("Discovery: ripgrep file discovery extracts valid files", () => {
   const files = discoverCandidateFiles("chunker and symbols");
   assert.ok(Array.isArray(files));
@@ -192,7 +270,7 @@ test("MCP: initialize returns protocol version, server info and tool capability"
   assert.equal(res.jsonrpc, "2.0");
   assert.equal(res.id, 1);
   assert.equal(res.result.protocolVersion, "2024-11-05");
-  assert.deepEqual(res.result.serverInfo, { name: "slm-reranker", version: "0.6.5" });
+  assert.deepEqual(res.result.serverInfo, { name: "slm-reranker", version: "0.6.6" });
   assert.deepEqual(res.result.capabilities, { tools: {} });
 });
 

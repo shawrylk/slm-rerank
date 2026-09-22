@@ -142,113 +142,215 @@ async def auto_discover_endpoint(
     return results[0]
 
 
+CODE_EXTS = {".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".rs", ".go", ".c", ".cpp", ".h"}
+
+QUERY_STOP_WORDS = {
+    "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "of", "for",
+    "with", "from", "into", "by", "as", "is", "are", "was", "were", "be",
+    "code", "file", "function", "method", "class", "find", "search", "how", "what", "where",
+}
+
+IGNORE_GLOBS = ["!node_modules", "!.git", "!dist", "!build", "!coverage", "!__pycache__", "!.venv"]
+MAX_SEARCH_TERMS = 6    # one rg invocation each, so this is the cost knob
+PATH_HIT_WEIGHT = 2     # a term in the path is a stronger signal than one body mention
+TEST_FILE_FACTOR = 0.5  # tests restate domain vocabulary; rank them below implementations
+MIN_STEM_LENGTH = 4
+NO_MATCH_SAMPLE = 20
+
+_WORD_RE = re.compile(r"\b[a-z0-9_]{2,}\b")
+_PLURAL_ES_RE = re.compile(r"(?:s|x|z|ch|sh)es$")
+_TEST_DIR_RE = re.compile(r"(^|/)(tests?|__tests__|specs?)(/|$)")
+_TEST_FILE_RE = re.compile(r"\.(test|spec)\.[a-z0-9]+$")
+_TEST_SUFFIX_RE = re.compile(r"_test\.[a-z0-9]+$")
+
+
+def _glob_args() -> List[str]:
+    args: List[str] = []
+    for glob in IGNORE_GLOBS:
+        args.extend(["--glob", glob])
+    return args
+
+
+def _stem_variants(word: str) -> List[str]:
+    """Suffix stems, emitted next to their root so a term cap never severs them."""
+    out: List[str] = []
+
+    def add(stem: str) -> None:
+        if len(stem) >= MIN_STEM_LENGTH and stem not in out:
+            out.append(stem)
+
+    if word.endswith("ing") and len(word) > 6:
+        add(word[:-3])
+    elif word.endswith("ion") and len(word) > 6:
+        base = word[:-3]
+        add(base)           # migration -> migrat, which substring-matches migrate too
+        add(base + "e")     # migration -> migrate
+    elif word.endswith("ate") and len(word) > 5:
+        add(word[:-1])
+    elif word.endswith("ed") and len(word) > 5:
+        add(word[:-2])
+    elif _PLURAL_ES_RE.search(word) and len(word) > 4:
+        add(word[:-2])      # classes -> class, boxes -> box
+    elif word.endswith("s") and not word.endswith("ss") and len(word) > 4:
+        add(word[:-1])      # exports -> export, but harness stays harness
+    return out
+
+
+def extract_query_terms(query: str) -> List[str]:
+    """Query -> ordered search terms, stop words dropped, each stem following its root."""
+    if not query or not isinstance(query, str):
+        return []
+
+    raw_words = [w for w in _WORD_RE.findall(query.lower()) if w not in QUERY_STOP_WORDS]
+    if not raw_words:
+        first = query.strip().split()
+        if first:
+            raw_words.append(first[0].lower())
+
+    terms: List[str] = []
+
+    def push(term: str) -> None:
+        if term and term not in terms:
+            terms.append(term)
+
+    for word in raw_words:
+        push(word)
+        for stem in _stem_variants(word):
+            push(stem)
+    return terms
+
+
+def is_test_path(file_path: str) -> bool:
+    """Tests mention domain vocabulary constantly; this keeps them from crowding the budget."""
+    lower = file_path.lower()
+    base = lower.rsplit("/", 1)[-1]
+    return bool(
+        _TEST_DIR_RE.search(lower)
+        or _TEST_FILE_RE.search(base)
+        or base.startswith("test_")
+        or _TEST_SUFFIX_RE.search(base)
+    )
+
+
+def _split_file_list(stdout: str, target_dir: Path, check_exists: bool) -> List[str]:
+    files: List[str] = []
+    for line in stdout.split("\n"):
+        trimmed = line.strip()
+        if not trimmed or Path(trimmed).suffix not in CODE_EXTS:
+            continue
+        if check_exists and not (target_dir / trimmed).exists():
+            continue
+        files.append(trimmed)
+    return files
+
+
+def _list_repo_files(target_dir: Path) -> List[str]:
+    """Every code file in the tree, for path matching. Empty when neither tool is available."""
+    if shutil.which("rg"):
+        try:
+            res = subprocess.run(
+                ["rg", "--files"] + _glob_args(),
+                cwd=target_dir, capture_output=True, text=True, timeout=10.0,
+            )
+            if res.returncode == 0 and res.stdout:
+                return _split_file_list(res.stdout, target_dir, False)
+        except (subprocess.SubprocessError, OSError):
+            pass
+
+    if shutil.which("git"):
+        try:
+            res = subprocess.run(
+                ["git", "ls-files"],
+                cwd=target_dir, capture_output=True, text=True, timeout=10.0,
+            )
+            if res.returncode == 0 and res.stdout:
+                return _split_file_list(res.stdout, target_dir, True)
+        except (subprocess.SubprocessError, OSError):
+            pass
+    return []
+
+
+def _find_body_matches(target_dir: Path, terms: List[str]) -> Dict[str, set]:
+    """file -> set of terms matched in its contents."""
+    hits: Dict[str, set] = {}
+
+    def record(file_path: str, term: str) -> None:
+        hits.setdefault(file_path, set()).add(term)
+
+    if shutil.which("rg"):
+        for term in terms:
+            try:
+                res = subprocess.run(
+                    ["rg", "--files-with-matches", "--ignore-case", "--max-count", "1"]
+                    + _glob_args() + [term],
+                    cwd=target_dir, capture_output=True, text=True, timeout=10.0,
+                )
+                if res.returncode == 0 and res.stdout:
+                    for f in _split_file_list(res.stdout, target_dir, False):
+                        record(f, term)
+            except (subprocess.SubprocessError, OSError):
+                break
+        return hits
+
+    if shutil.which("git"):
+        for term in terms:
+            try:
+                res = subprocess.run(
+                    ["git", "grep", "-l", "-i", term],
+                    cwd=target_dir, capture_output=True, text=True, timeout=10.0,
+                )
+                if res.returncode == 0 and res.stdout:
+                    for f in _split_file_list(res.stdout, target_dir, True):
+                        record(f, term)
+            except (subprocess.SubprocessError, OSError):
+                break
+    return hits
+
+
 def discover_candidate_files(query: str, cwd: Optional[str] = None, limit: int = 60) -> List[str]:
     """
     Smart candidate file discovery using ripgrep (rg) with git grep / git ls-files fallback.
-    Extracts high-signal query terms to locate matching files across large codebases in milliseconds.
+
+    Recall is a union of two signals, always both consulted and then ranked: where a term
+    appears in a file's *path* and where it appears in its *body*. Gating path matching
+    behind "content search found nothing" used to make a file named after the thing you
+    asked for unreachable as soon as any other file mentioned the words -- which is
+    precisely what test files do.
     """
-    target_dir = cwd or os.getcwd()
-    if not query or not query.strip():
+    terms = extract_query_terms(query)
+    if not terms:
         return []
 
-    stop_words = {
-        "a", "an", "the", "and", "or", "but", "not", "in", "on", "at", "to", "of", "for",
-        "with", "from", "into", "by", "as", "is", "are", "was", "were", "be", "been",
-        "code", "codes", "file", "files", "function", "method", "class", "find", "search", "how", "what", "where"
-    }
+    target_dir = Path(cwd) if cwd else Path.cwd()
+    repo_files = _list_repo_files(target_dir)
+    # Path matching is in-memory, so every term is used; only content search is capped.
+    body_hits = _find_body_matches(target_dir, terms[:MAX_SEARCH_TERMS])
 
-    raw_words = re.findall(r"\b[a-zA-Z0-9_]{2,}\b", query.lower())
-    terms = [w for w in raw_words if w not in stop_words]
-    if not terms and raw_words:
-        terms = [raw_words[0]]
+    scored: Dict[str, Dict[str, set]] = {}
 
-    # Stemming & term expansion (e.g. chunking -> chunk)
-    expanded_terms = list(terms)
-    for t in terms:
-        if t.endswith("ing") and len(t) > 4:
-            stem = t[:-3]
-            if stem not in expanded_terms:
-                expanded_terms.append(stem)
-        elif t.endswith("ed") and len(t) > 3:
-            stem = t[:-2]
-            if stem not in expanded_terms:
-                expanded_terms.append(stem)
-        elif t.endswith("s") and len(t) > 3:
-            stem = t[:-1]
-            if stem not in expanded_terms:
-                expanded_terms.append(stem)
+    def entry_for(file_path: str) -> Dict[str, set]:
+        return scored.setdefault(file_path, {"path": set(), "body": set()})
 
-    code_exts = {".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".rs", ".go", ".c", ".cpp", ".h"}
-    collected: set[str] = set()
+    for file_path in repo_files:
+        lower = file_path.lower()
+        for term in terms:
+            if term in lower:
+                entry_for(file_path)["path"].add(term)
 
-    # 1. Try ripgrep if installed
-    if shutil.which("rg"):
-        for term in expanded_terms[:3]:
-            if len(collected) >= limit:
-                break
-            try:
-                cmd = [
-                    "rg",
-                    "--files-with-matches",
-                    "--ignore-case",
-                    "--max-count", "1",
-                    "--glob", "!node_modules",
-                    "--glob", "!.git",
-                    "--glob", "!dist",
-                    "--glob", "!build",
-                    "--glob", "!coverage",
-                    "--glob", "!__pycache__",
-                    "--glob", "!.venv",
-                    term,
-                ]
-                res = subprocess.run(cmd, cwd=target_dir, capture_output=True, text=True, timeout=3.0)
-                if res.returncode == 0 and res.stdout:
-                    for line in res.stdout.strip().split("\n"):
-                        f = line.strip()
-                        if f and os.path.isfile(os.path.join(target_dir, f)) and any(f.endswith(ext) for ext in code_exts):
-                            collected.add(f)
-                            if len(collected) >= limit:
-                                break
-            except Exception:
-                pass
+    for file_path, matched_terms in body_hits.items():
+        entry_for(file_path)["body"].update(matched_terms)
 
-    # 2. Fallback to git grep if ripgrep not installed or returned nothing
-    if not collected and shutil.which("git"):
-        for term in expanded_terms[:3]:
-            if len(collected) >= limit:
-                break
-            try:
-                cmd = ["git", "grep", "-l", "-i", term]
-                res = subprocess.run(cmd, cwd=target_dir, capture_output=True, text=True, timeout=3.0)
-                if res.returncode == 0 and res.stdout:
-                    for line in res.stdout.strip().split("\n"):
-                        f = line.strip()
-                        if f and os.path.isfile(os.path.join(target_dir, f)) and any(f.endswith(ext) for ext in code_exts):
-                            collected.add(f)
-                            if len(collected) >= limit:
-                                break
-            except Exception:
-                pass
+    ranked = []
+    for file_path, hit in scored.items():
+        if not hit["path"] and not hit["body"]:
+            continue
+        score = PATH_HIT_WEIGHT * len(hit["path"]) + len(hit["body"])
+        if is_test_path(file_path):
+            score *= TEST_FILE_FACTOR
+        ranked.append((score, file_path.count("/"), file_path))
 
-    # 3. Fallback to git ls-files path matching
-    if not collected and shutil.which("git"):
-        try:
-            res = subprocess.run(["git", "ls-files"], cwd=target_dir, capture_output=True, text=True, timeout=3.0)
-            if res.returncode == 0 and res.stdout:
-                for line in res.stdout.strip().split("\n"):
-                    f = line.strip()
-                    if any(f.endswith(ext) for ext in code_exts):
-                        f_lower = f.lower()
-                        if any(t in f_lower for t in expanded_terms):
-                            collected.add(f)
-                            if len(collected) >= limit:
-                                break
-                if not collected:
-                    for line in res.stdout.strip().split("\n")[:20]:
-                        f = line.strip()
-                        if any(f.endswith(ext) for ext in code_exts):
-                            collected.add(f)
-        except Exception:
-            pass
+    if not ranked:
+        return repo_files[:NO_MATCH_SAMPLE]
 
-    return sorted(list(collected))
+    ranked.sort(key=lambda r: (-r[0], r[1], r[2]))
+    return [file_path for _, _, file_path in ranked[:limit]]

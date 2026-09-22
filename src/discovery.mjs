@@ -116,121 +116,193 @@ export async function autoDiscoverEndpoint({
  * Smart candidate file auto-discovery via ripgrep (rg), git grep, or git ls-files.
  * Allows running `slm-rerank -q "query"` without passing manual file globs.
  */
-export function discoverCandidateFiles(query, { cwd = process.cwd(), limit = 60 } = {}) {
-  if (!query || typeof query !== "string") return [];
+/**
+ * Smart candidate file auto-discovery via ripgrep (rg), git grep, or git ls-files.
+ * Allows running `slm-rerank -q "query"` without passing manual file globs.
+ *
+ * Recall is a union of two signals, always both consulted and then ranked:
+ * where a term appears in a file's *path* and where it appears in its *body*.
+ * Gating path matching behind "content search found nothing" used to make a file
+ * named after the thing you asked for unreachable as soon as any other file
+ * mentioned the words -- which is precisely what test files do.
+ */
+const CODE_EXTS = new Set([".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".rs", ".go", ".c", ".cpp", ".h"]);
 
-  // Extract key search terms (excluding short / stop words)
-  const stopWords = new Set([
-    "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "of", "for",
-    "with", "from", "into", "by", "as", "is", "are", "was", "were", "be",
-    "code", "file", "function", "method", "class", "find", "search", "how", "what", "where"
-  ]);
+const QUERY_STOP_WORDS = new Set([
+  "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "of", "for",
+  "with", "from", "into", "by", "as", "is", "are", "was", "were", "be",
+  "code", "file", "function", "method", "class", "find", "search", "how", "what", "where"
+]);
+
+const IGNORE_GLOBS = ["!node_modules", "!.git", "!dist", "!build", "!coverage", "!__pycache__", "!.venv"];
+const MAX_SEARCH_TERMS = 6;   // one rg spawn each, so this is the cost knob
+const PATH_HIT_WEIGHT = 2;    // a term in the path is a stronger signal than one body mention
+const TEST_FILE_FACTOR = 0.5; // tests restate domain vocabulary; rank them below implementations
+const MIN_STEM_LENGTH = 4;
+const NO_MATCH_SAMPLE = 20;
+
+function globArgs() {
+  return IGNORE_GLOBS.flatMap(g => ["--glob", g]);
+}
+
+/** Suffix stems, emitted next to their root so a term cap never severs them. */
+function stemVariants(word) {
+  const out = [];
+  const add = s => { if (s.length >= MIN_STEM_LENGTH && !out.includes(s)) out.push(s); };
+
+  if (word.endsWith("ing") && word.length > 6) {
+    add(word.slice(0, -3));
+  } else if (word.endsWith("ion") && word.length > 6) {
+    const base = word.slice(0, -3);
+    add(base);          // migration -> migrat, which substring-matches migrate too
+    add(`${base}e`);    // migration -> migrate
+  } else if (word.endsWith("ate") && word.length > 5) {
+    add(word.slice(0, -1));
+  } else if (word.endsWith("ed") && word.length > 5) {
+    add(word.slice(0, -2));
+  } else if (/(?:s|x|z|ch|sh)es$/.test(word) && word.length > 4) {
+    add(word.slice(0, -2));   // classes -> class, boxes -> box
+  } else if (word.endsWith("s") && !word.endsWith("ss") && word.length > 4) {
+    add(word.slice(0, -1));   // exports -> export, but harness stays harness
+  }
+  return out;
+}
+
+/** Query -> ordered search terms, stop words dropped, each stem following its root. */
+export function extractQueryTerms(query) {
+  if (!query || typeof query !== "string") return [];
 
   const rawWords = query
     .toLowerCase()
     .match(/\b[a-z0-9_]{2,}\b/g)
-    ?.filter(w => !stopWords.has(w)) || [];
+    ?.filter(w => !QUERY_STOP_WORDS.has(w)) || [];
 
   if (!rawWords.length) {
-    rawWords.push(query.trim().split(/\s+/)[0]);
+    const first = query.trim().split(/\s+/)[0];
+    if (first) rawWords.push(first.toLowerCase());
   }
 
-  // Stemming & term expansion (e.g. chunking -> chunk)
-  const expandedTerms = [...rawWords];
-  for (const t of rawWords) {
-    if (t.endsWith("ing") && t.length > 4) {
-      const stem = t.slice(0, -3);
-      if (!expandedTerms.includes(stem)) expandedTerms.push(stem);
-    } else if (t.endsWith("ed") && t.length > 3) {
-      const stem = t.slice(0, -2);
-      if (!expandedTerms.includes(stem)) expandedTerms.push(stem);
-    } else if (t.endsWith("s") && t.length > 3) {
-      const stem = t.slice(0, -1);
-      if (!expandedTerms.includes(stem)) expandedTerms.push(stem);
-    }
+  const terms = [];
+  const push = t => { if (t && !terms.includes(t)) terms.push(t); };
+  for (const word of rawWords) {
+    push(word);
+    for (const stem of stemVariants(word)) push(stem);
   }
+  return terms;
+}
 
-  const codeExts = new Set([".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".rs", ".go", ".c", ".cpp", ".h"]);
-  const collectedFiles = new Set();
+/** Tests mention domain vocabulary constantly; this keeps them from crowding the budget. */
+export function isTestPath(filePath) {
+  const lower = filePath.toLowerCase();
+  const base = lower.split("/").pop() || lower;
+  return /(^|\/)(tests?|__tests__|specs?)(\/|$)/.test(lower)
+    || /\.(test|spec)\.[a-z0-9]+$/.test(base)
+    || /^test_/.test(base)
+    || /_test\.[a-z0-9]+$/.test(base);
+}
 
-  // 1. Try ripgrep first
+function splitFileList(stdout, cwd, checkExists) {
+  const files = [];
+  for (const line of stdout.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || !CODE_EXTS.has(path.extname(trimmed))) continue;
+    if (checkExists && !fs.existsSync(path.resolve(cwd, trimmed))) continue;
+    files.push(trimmed);
+  }
+  return files;
+}
+
+/** Every code file in the tree, for path matching. Empty when neither tool is available. */
+function listRepoFiles(cwd) {
   try {
-    for (const term of expandedTerms.slice(0, 3)) {
-      if (collectedFiles.size >= limit) break;
-      const res = spawnSync("rg", [
-        "--files-with-matches",
-        "--ignore-case",
-        "--max-count", "1",
-        "--glob", "!node_modules",
-        "--glob", "!.git",
-        "--glob", "!dist",
-        "--glob", "!build",
-        "--glob", "!coverage",
-        "--glob", "!__pycache__",
-        "--glob", "!.venv",
-        term
-      ], { cwd, encoding: "utf-8", maxBuffer: 10 * 1024 * 1024 });
-
-      if (res.status === 0 && res.stdout) {
-        for (const line of res.stdout.split("\n")) {
-          const trimmed = line.trim();
-          if (trimmed && fs.existsSync(path.resolve(cwd, trimmed)) && codeExts.has(path.extname(trimmed))) {
-            collectedFiles.add(trimmed);
-            if (collectedFiles.size >= limit) break;
-          }
-        }
-      }
-    }
+    const rg = spawnSync("rg", ["--files", ...globArgs()], { cwd, encoding: "utf-8", maxBuffer: 10 * 1024 * 1024 });
+    if (rg.status === 0 && rg.stdout) return splitFileList(rg.stdout, cwd, false);
   } catch {
     // ripgrep not available
   }
+  try {
+    const git = spawnSync("git", ["ls-files"], { cwd, encoding: "utf-8", maxBuffer: 10 * 1024 * 1024 });
+    if (git.status === 0 && git.stdout) return splitFileList(git.stdout, cwd, true);
+  } catch {
+    // not a git repository
+  }
+  return [];
+}
 
-  // 2. Fallback to git grep if ripgrep not available or found nothing
-  if (collectedFiles.size === 0) {
+/** file -> set of terms matched in its contents. */
+function findBodyMatches(cwd, terms) {
+  const hits = new Map();
+  const record = (file, term) => {
+    if (!hits.has(file)) hits.set(file, new Set());
+    hits.get(file).add(term);
+  };
+
+  let ripgrepUsable = false;
+  for (const term of terms) {
     try {
-      for (const term of expandedTerms.slice(0, 3)) {
-        if (collectedFiles.size >= limit) break;
-        const gitGrep = spawnSync("git", ["grep", "-l", "-i", term], { cwd, encoding: "utf-8" });
-        if (gitGrep.status === 0 && gitGrep.stdout) {
-          for (const line of gitGrep.stdout.split("\n")) {
-            const trimmed = line.trim();
-            if (trimmed && fs.existsSync(path.resolve(cwd, trimmed)) && codeExts.has(path.extname(trimmed))) {
-              collectedFiles.add(trimmed);
-              if (collectedFiles.size >= limit) break;
-            }
-          }
-        }
+      const res = spawnSync("rg", [
+        "--files-with-matches", "--ignore-case", "--max-count", "1", ...globArgs(), term
+      ], { cwd, encoding: "utf-8", maxBuffer: 10 * 1024 * 1024 });
+      if (res.error) break;
+      ripgrepUsable = true;
+      if (res.status === 0 && res.stdout) {
+        for (const f of splitFileList(res.stdout, cwd, false)) record(f, term);
       }
     } catch {
-      // git grep failed
+      break;
     }
   }
 
-  // 3. Fallback to git ls-files path matching
-  if (collectedFiles.size === 0) {
+  if (ripgrepUsable) return hits;
+
+  for (const term of terms) {
     try {
-      const gitRes = spawnSync("git", ["ls-files"], { cwd, encoding: "utf-8" });
-      if (gitRes.status === 0 && gitRes.stdout) {
-        const allFiles = gitRes.stdout.split("\n").filter(f => codeExts.has(path.extname(f)));
-
-        for (const f of allFiles) {
-          const lower = f.toLowerCase();
-          if (expandedTerms.some(t => lower.includes(t))) {
-            collectedFiles.add(f);
-            if (collectedFiles.size >= limit) break;
-          }
-        }
-
-        if (collectedFiles.size === 0) {
-          for (const f of allFiles.slice(0, 20)) {
-            collectedFiles.add(f);
-          }
-        }
+      const res = spawnSync("git", ["grep", "-l", "-i", term], { cwd, encoding: "utf-8", maxBuffer: 10 * 1024 * 1024 });
+      if (res.status === 0 && res.stdout) {
+        for (const f of splitFileList(res.stdout, cwd, true)) record(f, term);
       }
     } catch {
-      // Not a git repository
+      break;
     }
   }
+  return hits;
+}
 
-  return Array.from(collectedFiles);
+export function discoverCandidateFiles(query, { cwd = process.cwd(), limit = 60 } = {}) {
+  const terms = extractQueryTerms(query);
+  if (!terms.length) return [];
+
+  const repoFiles = listRepoFiles(cwd);
+  // Path matching is in-memory, so every term is used; only content search is capped.
+  const bodyHits = findBodyMatches(cwd, terms.slice(0, MAX_SEARCH_TERMS));
+
+  const scored = new Map();
+  const entryFor = file => {
+    if (!scored.has(file)) scored.set(file, { pathTerms: new Set(), bodyTerms: new Set() });
+    return scored.get(file);
+  };
+
+  for (const file of repoFiles) {
+    const lower = file.toLowerCase();
+    for (const term of terms) {
+      if (lower.includes(term)) entryFor(file).pathTerms.add(term);
+    }
+  }
+  for (const [file, matchedTerms] of bodyHits) {
+    const entry = entryFor(file);
+    for (const term of matchedTerms) entry.bodyTerms.add(term);
+  }
+
+  const ranked = [];
+  for (const [file, hit] of scored) {
+    if (!hit.pathTerms.size && !hit.bodyTerms.size) continue;
+    let score = PATH_HIT_WEIGHT * hit.pathTerms.size + hit.bodyTerms.size;
+    if (isTestPath(file)) score *= TEST_FILE_FACTOR;
+    ranked.push({ file, score, depth: file.split("/").length });
+  }
+
+  if (!ranked.length) return repoFiles.slice(0, NO_MATCH_SAMPLE);
+
+  ranked.sort((a, b) => b.score - a.score || a.depth - b.depth || (a.file < b.file ? -1 : 1));
+  return ranked.slice(0, limit).map(r => r.file);
 }

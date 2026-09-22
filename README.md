@@ -44,7 +44,17 @@ The **Wide Reranker** is an ultra-high-throughput, prefill-dominant semantic fil
   discovery reports why instead of returning an endpoint that is not there.
 
 ### 6. Smart Ripgrep Candidate Discovery
-- Run `slm-rerank -q "query"` without file arguments; fast ripgrep lexical probing gathers top candidate files across massive repos in ~15ms.
+- Runs when no paths or globs are passed: `slm-rerank -q "auth token"` finds its own candidates.
+- Recall is a **ranked union of two signals** — terms matching a file's *path* and terms
+  matching its *body* — never one gated behind the other. A file named after what you asked
+  for stays reachable even when a dozen test files mention the same words.
+- Candidates are ranked by how many distinct terms hit (a path hit counts double), with test
+  files ranked below implementations, then truncated to the limit. Ordering is by relevance,
+  not directory traversal.
+- Query terms are stemmed with each stem kept beside its root (`migration` → `migrat`,
+  `migrate`; `chunking` → `chunk`; `classes` → `class`), so a term cap never severs a stem
+  from the word it came from.
+- Requires `rg` (ripgrep) or `git` on PATH; ripgrep is preferred and also reaches untracked files.
 
 ### 7. AST "Ghost Stubs" / Context Skeletons (`--stub` / `--slice`)
 - Drastically reduces frontier model context window consumption: preserves imports, types, and the target chunk while collapsing non-relevant sibling functions into 1-line stubs (`folded N lines`).
