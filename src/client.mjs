@@ -1,4 +1,6 @@
-// Reranker Client for Node.js: model-agnostic binary logprob evaluator
+// Reranker Client for Node.js: model-agnostic binary logprob evaluator with Ghost Stubs & Slice Boundaries
+import { detectSlice, groupBySlice } from "./boundary.mjs";
+import { generateGhostStub } from "./stubber.mjs";
 
 export class Reranker {
   constructor(options = {}) {
@@ -70,7 +72,7 @@ export class Reranker {
       });
 
       if (!resp.ok) {
-        return { chunk, score: 0.0, rawScore: 0.0, error: `HTTP ${resp.status}` };
+        return { chunk, score: 0.0, rawScore: 0.0, error: `HTTP ${resp.status}`, slice: detectSlice(chunk.filePath) };
       }
 
       const data = await resp.json();
@@ -79,10 +81,11 @@ export class Reranker {
       return {
         chunk,
         score: Math.round(rawScore * 10000) / 10000,
-        rawScore: Math.round(rawScore * 10000) / 10000
+        rawScore: Math.round(rawScore * 10000) / 10000,
+        slice: detectSlice(chunk.filePath)
       };
     } catch (err) {
-      return { chunk, score: 0.0, rawScore: 0.0, error: err.message };
+      return { chunk, score: 0.0, rawScore: 0.0, error: err.message, slice: detectSlice(chunk.filePath) };
     }
   }
 
@@ -90,10 +93,13 @@ export class Reranker {
     const withContext = options.withContext ?? false;
     const full = options.full ?? false;
     const threshold = options.threshold ?? this.threshold;
+    const stub = options.stub ?? false;
+    const gitDiff = options.gitDiff ?? false;
+    const dirtyOnly = options.dirtyOnly ?? false;
 
-    // Apply Tier-1 hybrid pre-filter
+    // Apply Tier-1 hybrid pre-filter (with git-diff biasing support)
     const { applyTwoTierFilter } = await import("./filter.mjs");
-    const { retained, tier1Applied, reason } = applyTwoTierFilter(chunks, query, full);
+    const { retained, tier1Applied, reason } = applyTwoTierFilter(chunks, query, { full, gitDiff, dirtyOnly });
 
     // Concurrently score chunks in slots
     const results = [];
@@ -108,9 +114,23 @@ export class Reranker {
     results.sort((a, b) => b.score - a.score);
 
     const filtered = results.filter(r => r.score >= threshold);
+    const finalResults = filtered.length ? filtered : results.slice(0, 3);
+
+    // If stub / skeleton requested, attach Ghost Stub to top candidate results
+    if (stub) {
+      for (const item of finalResults) {
+        const ghost = generateGhostStub(item.chunk.filePath, item.chunk);
+        item.ghostStub = ghost.stub;
+        item.foldedLines = ghost.foldedLines;
+      }
+    }
+
+    const bySlice = groupBySlice(finalResults);
+
     return {
       query,
-      results: filtered.length ? filtered : results.slice(0, 3),
+      results: finalResults,
+      bySlice,
       totalEvaluated: retained.length,
       tier1Applied,
       filterReason: reason

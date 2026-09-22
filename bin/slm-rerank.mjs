@@ -5,15 +5,23 @@ import fs from "node:fs";
 import { parseArgs } from "node:util";
 import { Reranker } from "../src/client.mjs";
 import { prepareCandidates } from "../src/chunker.mjs";
+import { autoDiscoverEndpoint, discoverCandidateFiles } from "../src/discovery.mjs";
+import { groupBySlice } from "../src/boundary.mjs";
 
 const options = {
   query: { type: "string", short: "q" },
   "base-url": { type: "string", short: "e" },
+  host: { type: "string" },
   model: { type: "string", short: "m" },
   threshold: { type: "string", short: "t" },
   top: { type: "string", short: "k" },
   full: { type: "boolean", default: false },
   "with-context": { type: "boolean", default: false },
+  stub: { type: "boolean", default: false },
+  slice: { type: "boolean", default: false },
+  dirty: { type: "boolean", default: false },
+  "git-diff": { type: "boolean", default: false },
+  "by-slice": { type: "boolean", default: false },
   json: { type: "boolean", default: false },
   help: { type: "boolean", short: "h" }
 };
@@ -24,44 +32,105 @@ Usage: slm-rerank --query <query> [options] [files...]
 
 Options:
   -q, --query <string>     Search query (required)
-  -e, --base-url <url>     Endpoint URL (default: http://localhost:8034/v1)
-  -m, --model <string>     Target model name (default: lfm)
+  -e, --base-url <url>     Endpoint URL (probes ports 8033-8040 if omitted)
+      --host <string>      Target server host (default: 127.0.0.1 or SLM_HOST)
+  -m, --model <string>     Target model name/profile (e.g. lfm, qwen, gemma)
   -t, --threshold <float>  Relevance threshold [0.0, 1.0] (default: 0.65)
   -k, --top <int>          Maximum top candidates to return
+      --stub, --slice      Generate AST Ghost Stubs for top results (token-saver)
+      --dirty              Bias or filter by git uncommitted/modified files
+      --git-diff           Boost candidates recently touched in git history
+      --by-slice           Group results by architectural vertical slice
       --full               Force full GPU evaluation (bypass Tier-1 filter)
       --with-context       Stitch 1-hop type and call context (<= 150 tokens)
       --json               Output raw JSON
   -h, --help               Show help
+
+Note: If no files or globs are passed, slm-rerank automatically runs smart
+ripgrep/git auto-discovery to locate the top candidate files across the repo.
 `);
 }
 
 async function runNative(query, files, parsed) {
-  const baseUrl = parsed.values["base-url"] || process.env.SLM_ENDPOINT || "http://localhost:8034/v1";
-  const model = parsed.values.model || "lfm";
-  const threshold = parsed.values.threshold ? parseFloat(parsed.values.threshold) : 0.65;
+  const host = parsed.values.host || process.env.SLM_HOST || "127.0.0.1";
+  const requestedModel = parsed.values.model || null;
+  const withStub = parsed.values.stub || parsed.values.slice || false;
   const withContext = parsed.values["with-context"];
   const full = parsed.values.full;
+  const dirtyOnly = parsed.values.dirty;
+  const gitDiff = parsed.values["git-diff"] || parsed.values.dirty;
+  const showBySlice = parsed.values["by-slice"];
+  const topK = parsed.values.top ? parseInt(parsed.values.top, 10) : undefined;
+  const threshold = parsed.values.threshold ? parseFloat(parsed.values.threshold) : 0.65;
+
+  let baseUrl = parsed.values["base-url"];
+  let detectedPort = null;
+  let detectedModel = null;
+
+  if (!baseUrl) {
+    const discovered = await autoDiscoverEndpoint({ host, requestedModel });
+    baseUrl = discovered.url;
+    detectedPort = discovered.port;
+    detectedModel = discovered.modelId;
+  }
 
   const chunks = prepareCandidates(files);
   if (!chunks.length) {
-    console.error("Error: No candidate chunks found in provided paths.");
+    console.error("Error: No candidate code chunks found in target paths.");
     process.exit(1);
   }
 
-  const reranker = new Reranker({ baseUrl, model, threshold });
-  const result = await reranker.rerank(query, chunks, { withContext, full });
+  const reranker = new Reranker({
+    baseUrl,
+    model: requestedModel || "lfm",
+    threshold
+  });
+
+  const result = await reranker.rerank(query, chunks, {
+    withContext,
+    full,
+    stub: withStub,
+    gitDiff,
+    dirtyOnly
+  });
+
+  if (topK && result.results.length > topK) {
+    result.results = result.results.slice(0, topK);
+  }
 
   if (parsed.values.json) {
     console.log(JSON.stringify(result, null, 2));
     return;
   }
 
-  console.log(`\n🎯 SLM Semantic Reranker (Evaluated ${result.totalEvaluated} chunks)\n`);
-  result.results.forEach((item, idx) => {
-    const sym = item.chunk.symbol ? `(${item.chunk.symbol})` : "";
-    console.log(` #${idx + 1} | Score: ${(item.score * 100).toFixed(1)}% | ${item.chunk.filePath}:${item.chunk.startLine}-${item.chunk.endLine} ${sym}`);
-  });
-  console.log("");
+  const endpointInfo = detectedPort ? `port :${detectedPort} (${detectedModel})` : baseUrl;
+  console.log(`\n🎯 SLM Semantic Reranker via ${endpointInfo}`);
+  console.log(`Evaluated ${result.totalEvaluated} chunks | Query: "${query}"\n`);
+
+  if (showBySlice) {
+    const groups = groupBySlice(result.results);
+    for (const [sliceName, group] of Object.entries(groups)) {
+      console.log(`📦 [Slice: ${sliceName}] (${group.items.length} matches, max score: ${(group.maxScore * 100).toFixed(1)}%)`);
+      group.items.forEach((item, idx) => {
+        const sym = item.chunk.symbol ? `(${item.chunk.symbol})` : "";
+        console.log(`    #${idx + 1} | ${(item.score * 100).toFixed(1)}% | ${item.chunk.filePath}:${item.chunk.startLine}-${item.chunk.endLine} ${sym}`);
+      });
+      console.log("");
+    }
+  } else {
+    result.results.forEach((item, idx) => {
+      const sym = item.chunk.symbol ? `(${item.chunk.symbol})` : "";
+      const sliceTag = item.slice ? `[${item.slice}] ` : "";
+      console.log(` #${idx + 1} | Score: ${(item.score * 100).toFixed(1)}% | ${sliceTag}${item.chunk.filePath}:${item.chunk.startLine}-${item.chunk.endLine} ${sym}`);
+
+      if (withStub && item.ghostStub) {
+        console.log(`\n--- 👻 Ghost Stub (${item.foldedLines} lines folded) ---`);
+        console.log(item.ghostStub.slice(0, 800) + (item.ghostStub.length > 800 ? "\n..." : ""));
+        console.log("--------------------------------------------------\n");
+      }
+    });
+    console.log("");
+  }
 }
 
 async function main() {
@@ -86,10 +155,17 @@ async function main() {
     process.exit(1);
   }
 
-  const files = parsed.positionals;
+  let files = parsed.positionals;
   if (!files.length) {
-    console.error("Error: At least one file or directory path is required.");
-    process.exit(1);
+    // Feature: Smart auto-discovery via ripgrep/git
+    files = discoverCandidateFiles(query);
+    if (!files.length) {
+      console.error("Error: No relevant candidate files found automatically. Please specify file paths.");
+      process.exit(1);
+    }
+    if (!parsed.values.json) {
+      console.log(`🔍 Auto-discovered ${files.length} candidate files via ripgrep...`);
+    }
   }
 
   // If explicitly requested via SLM_ENGINE=python, delegate to python module

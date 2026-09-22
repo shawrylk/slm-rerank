@@ -35,9 +35,18 @@ The **Wide Reranker** is an ultra-high-throughput, prefill-dominant semantic fil
 - Stored locally at `~/.cache/slm-rerank/cache.db`.
 - Switching between LFM, Qwen, Gemma, or RWKV guarantees zero score cross-contamination.
 
-### 4. Auto-Detection & CLI Selection
-- Probe `GET /v1/models` at startup to auto-select `QwenProfile`, `LFMProfile`, `GemmaProfile`, or `RWKVProfile`.
-- Optional config file at `~/.config/reranker/config.yaml` to set default providers and endpoint mappings.
+### 5. Multi-Port Auto-Discovery (8033–8040)
+- Scans active models across dedicated ports `8033..8040` (e.g. 8033 Qwen, 8034 LFM 2.5, 8035-8040 others) in parallel (< 100ms).
+- Seamlessly resolves target port based on requested model profile or active hardware.
+
+### 6. Smart Ripgrep Candidate Discovery
+- Run `slm-rerank -q "query"` without file arguments; fast ripgrep lexical probing gathers top candidate files across massive repos in ~15ms.
+
+### 7. AST "Ghost Stubs" / Context Skeletons (`--stub` / `--slice`)
+- Drastically reduces frontier model context window consumption: preserves imports, types, and the target chunk while collapsing non-relevant sibling functions into 1-line stubs (`folded N lines`).
+
+### 8. Architecture-Aware Boundary Slicing (`--by-slice`)
+- Automatically clusters reranked code by architectural domain slice (`features/<slice>`, `modules/<slice>`, `packages/<slice>`).
 
 ---
 

@@ -9,10 +9,13 @@ import sys
 from pathlib import Path
 from typing import List, Optional
 
+from .boundary import detect_slice, group_by_slice
 from .cache import RerankCache
 from .client import LFMReranker
 from .config import load_config, resolve_endpoint_and_model
+from .discovery import auto_discover_endpoint, discover_candidate_files
 from .display import console, print_results
+from .stubber import generate_ghost_stub
 from .verifier import GroundTruthVerifier
 
 
@@ -33,7 +36,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "candidates",
         nargs="*",
-        help="Candidate file paths or text. If empty, reads from stdin pipe.",
+        help="Candidate file paths or text. If omitted, smart ripgrep auto-discovery is used.",
     )
     parser.add_argument(
         "--model",
@@ -49,7 +52,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         dest="base_url",
         type=str,
         default=None,
-        help="Server base endpoint URL (e.g. http://localhost:8034/v1, http://localhost:8033/v1)",
+        help="Server base endpoint URL (probes ports 8033-8040 if omitted)",
+    )
+    parser.add_argument(
+        "--host",
+        type=str,
+        default=os.environ.get("SLM_HOST", "127.0.0.1"),
+        help="Target server host (default: 127.0.0.1 or SLM_HOST)",
     )
     parser.add_argument(
         "--config",
@@ -85,6 +94,30 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         type=int,
         default=4,
         help="Number of concurrent requests to saturate server slots",
+    )
+    parser.add_argument(
+        "--stub",
+        "--slice",
+        dest="stub",
+        action="store_true",
+        help="Generate AST Ghost Stubs for top results to minimize frontier model tokens",
+    )
+    parser.add_argument(
+        "--dirty",
+        action="store_true",
+        help="Filter or heavily bias scoring by git uncommitted/modified files",
+    )
+    parser.add_argument(
+        "--git-diff",
+        dest="git_diff",
+        action="store_true",
+        help="Boost candidates recently touched in git history",
+    )
+    parser.add_argument(
+        "--by-slice",
+        dest="by_slice",
+        action="store_true",
+        help="Group results by architectural vertical slice",
     )
     parser.add_argument(
         "--no-cache",
@@ -140,7 +173,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 
 def collect_candidate_inputs(args: argparse.Namespace) -> List[str]:
-    """Collect candidate strings from CLI arguments or stdin."""
+    """Collect candidate strings from CLI arguments, stdin, or smart ripgrep discovery."""
     candidates: List[str] = []
 
     if args.candidates:
@@ -158,6 +191,14 @@ def collect_candidate_inputs(args: argparse.Namespace) -> List[str]:
                     continue
             candidates.append(line)
 
+    # Feature 2: Smart ripgrep candidate auto-discovery
+    if not candidates and args.query:
+        discovered = discover_candidate_files(args.query)
+        if discovered:
+            if not args.json:
+                console.print(f"[dim]🔍 Auto-discovered {len(discovered)} candidate files via ripgrep...[/dim]")
+            candidates.extend(discovered)
+
     return candidates
 
 
@@ -165,9 +206,19 @@ def main() -> int:
     args = parse_args()
     config_path = Path(args.config) if args.config else None
 
+    # Feature 1: Multi-port auto-discovery across 8033-8040
+    if not args.base_url:
+        discovered_endpoint = asyncio.run(
+            auto_discover_endpoint(host=args.host, requested_model=args.model)
+        )
+        args.base_url = discovered_endpoint["url"]
+        args.endpoint = args.base_url
+        if not args.json and discovered_endpoint.get("ok"):
+            console.print(f"[dim]🎯 Auto-discovered port :{discovered_endpoint['port']} ({discovered_endpoint['model_id']})[/dim]")
+
     candidate_inputs = collect_candidate_inputs(args)
     if not candidate_inputs:
-        console.print("[bold red]Error:[/bold red] No candidates provided via arguments or stdin pipe.", file=sys.stderr)
+        console.print("[bold red]Error:[/bold red] No candidates found or provided.", file=sys.stderr)
         console.print("Usage: lfm-rerank --query \"auth\" src/*.py", file=sys.stderr)
         console.print("Or piping: git ls-files | lfm-rerank --query \"auth\" --threshold 0.65", file=sys.stderr)
         return 1
@@ -208,7 +259,33 @@ def main() -> int:
         console.print(f"[bold red]Reranking failed:[/bold red] {e}", file=sys.stderr)
         return 1
 
-    print_results(response, as_json=args.json, show_manifest=not args.no_manifest)
+    # Attach slice tags to results
+    for item in response.results:
+        item.slice = detect_slice(getattr(item, "file_path", None))
+        if args.stub:
+            item.ghost_stub = generate_ghost_stub(item.file_path, item)
+
+    if args.by_slice and not args.json:
+        grouped = group_by_slice(response.results)
+        console.print(f"\n[bold cyan]📦 Architecture Slices ({len(grouped)} active slices):[/bold cyan]\n")
+        for s_name, group in grouped.items():
+            console.print(f"  [bold green][Slice: {s_name}][/bold green] ({len(group['items'])} items, max score: {group['max_score']*100:.1f}%)")
+            for idx, it in enumerate(group["items"], 1):
+                sym = f"({it.symbol})" if getattr(it, 'symbol', None) else ""
+                console.print(f"    #{idx} | {it.score*100:.1f}% | {it.file_path}:{it.citation.start_line}-{it.citation.end_line} {sym}")
+            console.print("")
+    else:
+        print_results(response, as_json=args.json, show_manifest=not args.no_manifest)
+
+        if args.stub and not args.json:
+            console.print("\n[bold cyan]👻 Top Candidate Ghost Stubs (Token-Saving Skeletons):[/bold cyan]\n")
+            for it in response.results[:2]:
+                if hasattr(it, "ghost_stub"):
+                    console.print(f"[dim]--- {it.file_path}:{it.citation.start_line} (Folded {it.ghost_stub['folded_lines']} lines) ---[/dim]")
+                    stub_preview = it.ghost_stub["stub"][:800]
+                    console.print(stub_preview + ("\n..." if len(it.ghost_stub["stub"]) > 800 else ""))
+                    console.print("[dim]------------------------------------------------[/dim]\n")
+
     return 0
 
 

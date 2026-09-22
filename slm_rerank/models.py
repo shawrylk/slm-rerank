@@ -97,6 +97,8 @@ class RerankResultItem(BaseModel):
     utility_trap_demoted: bool = False  # Clamped below the best domain-aligned chunk
     context_stitched: bool = False  # Scored with 1-hop stitched context
     tier1_lexical_score: Optional[float] = None  # Tier-1 hybrid pre-filter score, if it ran
+    slice: Optional[str] = None  # Architectural vertical slice
+    ghost_stub: Optional[Dict[str, Any]] = None  # AST Ghost Stub skeleton
 
 
 class AmbiguityEvent(BaseModel):
