@@ -92,30 +92,16 @@ async function main() {
     process.exit(1);
   }
 
-  // Check if python slm-rerank is installed in PATH
-  let hasPythonSlm = false;
-  try {
-    const check = spawn("slm-rerank", ["--help"], { stdio: "ignore" });
-    await new Promise((resolve) => {
-      check.on("close", (code) => {
-        hasPythonSlm = code === 0;
-        resolve();
-      });
-      check.on("error", () => resolve());
-    });
-  } catch {
-    hasPythonSlm = false;
+  // If explicitly requested via SLM_ENGINE=python, delegate to python module
+  if (process.env.SLM_ENGINE === "python") {
+    const args = ["-m", "slm_rerank.cli", ...process.argv.slice(2)];
+    const child = spawn("python3", args, { stdio: "inherit" });
+    child.on("close", (code) => process.exit(code || 0));
+    return;
   }
 
-  if (hasPythonSlm) {
-    // Delegate to Python CLI with streaming stdio
-    const args = process.argv.slice(2);
-    const child = spawn("slm-rerank", args, { stdio: "inherit" });
-    child.on("close", (code) => process.exit(code || 0));
-  } else {
-    // Run pure Node.js implementation
-    await runNative(query, files, parsed);
-  }
+  // Pure Node.js implementation (lightweight, zero-dep, LAN/remote capable)
+  await runNative(query, files, parsed);
 }
 
 main().catch((err) => {
