@@ -114,8 +114,16 @@ The model server must be running on `:8034` for the live paths (`llama-server ..
 
 ## 6. Known limitations and next steps
 
-1. **The support judge is the weak link.** An 8B model accepts some misinterpretations of real
-   lines. Options: a stricter judge prompt, an ensemble of judges, or a per-claim-type rule set.
+1. **The semantic judge is the weak link, and it is now measured.** The support question had a
+   retrieval-framed prompt and was miscalibrated. This branch gives it a dedicated prompt and adds a
+   contradiction gate, which catches the observed false positive ("the state variable is not
+   initialized" against `useState(0)`, contradiction `0.56`).
+
+   A five-case labeled set (`SEMANTIC_CASES` in `review_bench.py`) is evaluated by
+   `slm-rerank-review-bench --live`. Result on the local 8B model: precision `100%`, recall `0%`,
+   accuracy `60%`. Support probabilities were near `0.02` for true and false claims alike, so the
+   score does not separate them. The semantic gates are advisory until a stronger judge model is
+   available. That is why the deterministic gates remain the guarantee.
 2. **Live recall is model-bounded.** A weak model may quote no real lines; the pipeline then reports
    nothing. That is correct behaviour, not a bug, but it limits usefulness until generation quality
    improves.

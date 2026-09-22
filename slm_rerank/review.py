@@ -33,6 +33,9 @@ DEFAULT_TIMEOUT = 30.0
 DEFAULT_MAX_CLAIMS = 4
 MIN_EVIDENCE_CHARS = 12
 DEFAULT_SUPPORT_THRESHOLD = 0.5
+DEFAULT_CONTRADICTION_THRESHOLD = 0.5
+# Profiles with a ChatML judge prompt; others fall back to the support question alone.
+CHATML_JUDGE_PROFILES = {"lfm", "qwen"}
 
 # Reasons a candidate finding is not reported. Stable strings, so a caller can branch on them.
 REASON_EMPTY_EVIDENCE = "EMPTY_EVIDENCE"
@@ -43,6 +46,7 @@ REASON_EMPTY_CLAIM = "EMPTY_CLAIM"
 REASON_CLAIM_NOT_SUPPORTED = "CLAIM_NOT_SUPPORTED"
 REASON_SUPPORT_UNVERIFIED = "SUPPORT_UNVERIFIED"
 REASON_CLAIM_SYMBOL_NOT_IN_CHUNK = "CLAIM_SYMBOL_NOT_IN_CHUNK"
+REASON_CLAIM_CONTRADICTED = "CLAIM_CONTRADICTED"
 
 # Identifiers a claim names: a backticked token, a call, or a camelCase/PascalCase/snake_case name.
 _IDENTIFIER_RE = re.compile(r"`([^`]{2,})`|\b([A-Za-z_][A-Za-z0-9_]*)\s*\(|\b([A-Za-z_][A-Za-z0-9_]*)\b")
@@ -90,6 +94,8 @@ class ReviewReport(BaseModel):
     model_failures: int = 0
     semantic_gate: bool = False
     support_threshold: Optional[float] = None
+    contradiction_gate: bool = False
+    contradiction_threshold: Optional[float] = None
 
 
 def normalize_ws(value: str) -> str:
@@ -253,6 +259,25 @@ async def _generate(completion_url: str, prompt: str, timeout: float, client: ht
         return None
 
 
+def format_support_prompt(claim_text: str, evidence: str) -> str:
+    """Ask whether the code proves the claim.
+
+    The retrieval prompt asks whether a chunk is *relevant* to a query; a claim is not a
+    query and relevance is not proof, so the judge needs its own prompt. ChatML with the
+    reasoning bypass, used only for ChatML profiles.
+    """
+    return (
+        "<|startoftext|><|im_start|>system\n"
+        "You check whether a code line proves a claim about it.\n"
+        "Answer exactly \"yes\" if the code proves the claim, or \"no\" if it does not.\n"
+        "Relevant-looking code is not proof; the code must state what the claim states.\n"
+        "<|im_end|>\n"
+        f"<|im_start|>user\nCode:\n{evidence}\n\nClaim: {claim_text}\n"
+        "Does the code prove the claim? Respond only with yes or no.<|im_end|>\n"
+        "<|im_start|>assistant\n\u003cthink\u003e\n\u003c/think\u003e\n"
+    )
+
+
 async def _judge_support(
     engine: LFMReranker,
     claim: ReviewClaim,
@@ -270,17 +295,73 @@ async def _judge_support(
     profile = getattr(engine, "profile", None)
     if profile is None or not hasattr(profile, "format_prompt"):
         return "skipped", None
-    prompt = profile.format_prompt(
-        query=f"Claim: {claim.text}",
-        chunk_content=evidence,
-        file_path=claim.citation.file,
-        symbol=claim.citation.symbol,
-        is_test=False,
-        start_line=claim.citation.start_line,
-        end_line=claim.citation.end_line,
-    )
+    if getattr(profile, "name", None) in CHATML_JUDGE_PROFILES:
+        prompt = format_support_prompt(claim.text, evidence)
+    else:
+        prompt = profile.format_prompt(
+            query=f"Claim: {claim.text}",
+            chunk_content=evidence,
+            file_path=claim.citation.file,
+            symbol=claim.citation.symbol,
+            is_test=False,
+            start_line=claim.citation.start_line,
+            end_line=claim.citation.end_line,
+        )
     payload: Dict[str, Any] = {
         "prompt": prompt,
+        "n_predict": 1,
+        "n_probs": 10,
+        "temperature": 0.0,
+        "stop": list(getattr(profile, "stop_tokens", []) or []),
+    }
+    async with semaphore:
+        try:
+            response = await client.post(_completion_url(engine.raw_endpoint), json=payload, timeout=timeout)
+            if response.status_code != 200:
+                return "failed", None
+            score, _yes, _no, _ambiguous = profile.extract_calibrated_logprobs(
+                response.json(), chunk_token_est=max(1, len(evidence.split()))
+            )
+            return "scored", float(score)
+        except (httpx.HTTPError, ValueError, TypeError):
+            return "failed", None
+
+
+def format_contradiction_prompt(claim_text: str, evidence: str) -> str:
+    """Ask the opposite question: does the code contradict the claim?
+
+    ChatML with the reasoning bypass. Used only for ChatML profiles; the retrieval prompt
+    cannot express a contradiction question.
+    """
+    return (
+        "<|startoftext|><|im_start|>system\n"
+        "You check whether a code line contradicts a claim about it.\n"
+        "Answer exactly \"yes\" if the code contradicts the claim, or \"no\" if it does not.\n"
+        "<|im_end|>\n"
+        f"<|im_start|>user\nCode:\n{evidence}\n\nClaim: {claim_text}\n"
+        "Does the code contradict the claim? Respond only with yes or no.<|im_end|>\n"
+        "<|im_start|>assistant\n\u003cthink\u003e\n\u003c/think\u003e\n"
+    )
+
+
+async def _judge_contradiction(
+    engine: LFMReranker,
+    claim: ReviewClaim,
+    evidence: str,
+    timeout: float,
+    client: httpx.AsyncClient,
+    semaphore: asyncio.Semaphore,
+) -> Tuple[str, Optional[float]]:
+    """Ask whether the evidence contradicts the claim. A veto, not a requirement.
+
+    Returns the same status shape as :func:`_judge_support`. A caller rejects only on a
+    scored result at or above the threshold; a skipped or failed call does not reject.
+    """
+    profile = getattr(engine, "profile", None)
+    if profile is None or getattr(profile, "name", None) not in CHATML_JUDGE_PROFILES:
+        return "skipped", None
+    payload: Dict[str, Any] = {
+        "prompt": format_contradiction_prompt(claim.text, evidence),
         "n_predict": 1,
         "n_probs": 10,
         "temperature": 0.0,
@@ -306,6 +387,7 @@ async def _review_chunk(
     timeout: float,
     max_claims: int,
     support_threshold: Optional[float],
+    contradiction_threshold: Optional[float],
     client: httpx.AsyncClient,
     semaphore: asyncio.Semaphore,
 ) -> Tuple[List[ReviewFinding], List[DroppedClaim], int, int]:
@@ -347,6 +429,13 @@ async def _review_chunk(
                     DroppedClaim(text=claim.text, evidence=finding.evidence, citation=citation, reason=REASON_CLAIM_NOT_SUPPORTED)
                 )
                 continue
+        if contradiction_threshold is not None:
+            status, score = await _judge_contradiction(engine, claim, finding.evidence, timeout, client, semaphore)
+            if status == "scored" and score is not None and score >= contradiction_threshold:
+                dropped.append(
+                    DroppedClaim(text=claim.text, evidence=finding.evidence, citation=citation, reason=REASON_CLAIM_CONTRADICTED)
+                )
+                continue
         findings.append(finding)
     return findings, dropped, len(claims), 0
 
@@ -362,12 +451,14 @@ async def review(
     max_claims: int = DEFAULT_MAX_CLAIMS,
     concurrency: int = 4,
     support_threshold: Optional[float] = DEFAULT_SUPPORT_THRESHOLD,
+    contradiction_threshold: Optional[float] = DEFAULT_CONTRADICTION_THRESHOLD,
 ) -> ReviewReport:
     """Retrieve, generate and verify. Only evidence-backed findings are returned.
 
     ``support_threshold`` enables the semantic support gate: a finding must also be judged
-    supported by the calibrated binary scorer. Set it to ``None`` to run the evidence gate
-    alone, for example in an offline test.
+    supported by the calibrated binary scorer. ``contradiction_threshold`` enables the
+    contradiction gate, which vetoes a finding when the code is judged to contradict it.
+    Set either to ``None`` to disable it.
     """
     engine = reranker or LFMReranker()
     selection = await engine.rerank(
@@ -383,13 +474,25 @@ async def review(
         chunks_reviewed=len(verified),
         semantic_gate=support_threshold is not None,
         support_threshold=support_threshold,
+        contradiction_gate=contradiction_threshold is not None,
+        contradiction_threshold=contradiction_threshold,
     )
 
     semaphore = asyncio.Semaphore(max(1, concurrency))
     async with httpx.AsyncClient(timeout=timeout) as client:
         outcomes = await asyncio.gather(
             *(
-                _review_chunk(item, query, engine, timeout, max_claims, support_threshold, client, semaphore)
+                _review_chunk(
+                    item,
+                    query,
+                    engine,
+                    timeout,
+                    max_claims,
+                    support_threshold,
+                    contradiction_threshold,
+                    client,
+                    semaphore,
+                )
                 for item in verified
             )
         )
@@ -415,6 +518,7 @@ def review_sync(
     max_claims: int = DEFAULT_MAX_CLAIMS,
     concurrency: int = 4,
     support_threshold: Optional[float] = DEFAULT_SUPPORT_THRESHOLD,
+    contradiction_threshold: Optional[float] = DEFAULT_CONTRADICTION_THRESHOLD,
 ) -> ReviewReport:
     """Synchronous wrapper for :func:`review`."""
     return asyncio.run(
@@ -429,6 +533,7 @@ def review_sync(
             max_claims=max_claims,
             concurrency=concurrency,
             support_threshold=support_threshold,
+            contradiction_threshold=contradiction_threshold,
         )
     )
 
@@ -466,6 +571,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Minimum support probability from the binary judge.",
     )
     parser.add_argument("--no-support", action="store_true", help="Run the evidence gate only; skip the semantic judge.")
+    parser.add_argument(
+        "--contradiction-threshold",
+        type=float,
+        default=DEFAULT_CONTRADICTION_THRESHOLD,
+        help="Contradiction probability at or above which the finding is vetoed.",
+    )
+    parser.add_argument("--no-contradiction", action="store_true", help="Skip the contradiction gate.")
     parser.add_argument("--json", action="store_true", help="Print the report as JSON.")
     return parser
 
@@ -474,6 +586,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     engine = LFMReranker(endpoint=args.endpoint, model=args.model) if (args.endpoint or args.model) else LFMReranker()
     support = None if args.no_support else args.support_threshold
+    contradiction = None if args.no_contradiction else args.contradiction_threshold
     report = review_sync(
         query=args.query,
         candidates=args.paths,
@@ -481,6 +594,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         threshold=args.threshold,
         top_k=args.top,
         support_threshold=support,
+        contradiction_threshold=contradiction,
     )
     if args.json:
         print(report.model_dump_json(indent=2))

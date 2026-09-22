@@ -183,12 +183,24 @@ Three checks run, in order. The first two are deterministic:
 2. **Identifier gate.** Every code identifier the finding names must exist in the cited chunk. A
    finding about `onSkip` in a file that has no `onSkip` is dropped.
 3. **Support gate (best effort).** The calibrated binary scorer judges whether the evidence
-   supports the claim. This is a filter, not a guarantee: a small model can still read a real line
-   and draw the wrong conclusion. Set `--no-support` to run the evidence and identifier gates
-   alone.
+   proves the claim, through a dedicated judge prompt rather than the retrieval prompt.
+4. **Contradiction gate (best effort veto).** A second judge asks whether the code contradicts
+   the claim. A high score vetoes the finding. This catches a real case the support gate missed:
+   "the state variable is not initialized" against `useState(0)`.
 
 Every failure path returns fewer findings rather than raising, so a missing or confused model
 degrades the review; it never fabricates one.
+
+### Measured on the local 8B model
+
+The semantic gates are a filter, not a guarantee. On a five-case labeled set (`SEMANTIC_CASES` in
+`review_bench.py`), the local LFM2.5 judge rejected every case: precision stayed `100%` but recall
+fell to `0%`. Support probabilities were near `0.02` for true and false claims alike, so the score
+cannot separate them. The contradiction judge shows weak separation only (false `0.56` / `0.31` /
+`0.22` against true `0.36` / `0.15`).
+
+Treat the semantic gates as advisory until a stronger judge model is available. The evidence and
+identifier gates are the deterministic guarantee.
 
 ### Usage
 
@@ -197,7 +209,10 @@ degrades the review; it never fabricates one.
 slm-rerank-review "frontend/src/**/*.tsx" --query "find real defects" --top 5
 
 # Evidence and identifier gates only, no semantic judge
-slm-rerank-review src/app.ts --no-support
+slm-rerank-review src/app.ts --no-support --no-contradiction
+
+# Deterministic gates plus the semantic judges (default)
+slm-rerank-review src/app.ts --top 5
 
 # Machine-readable report
 slm-rerank-review src/app.ts --json
