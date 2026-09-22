@@ -108,10 +108,28 @@ test("Boundary: groups results by slice with max scores", () => {
 });
 
 test("Discovery: discovers live ports in 8033-8040 range", async () => {
-  const ep = await autoDiscoverEndpoint({ host: "127.0.0.1" });
-  assert.ok(ep.url);
-  assert.equal(ep.ok, true);
-  assert.equal(ep.port, 8034); // Active port on this workstation
+  const http = await import("node:http");
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ data: [{ id: "mock-lfm-model" }] }));
+  });
+
+  await new Promise(resolve => server.listen(8039, "127.0.0.1", resolve));
+
+  try {
+    const ep = await autoDiscoverEndpoint({ host: "127.0.0.1", ports: [8039] });
+    assert.ok(ep.url);
+    assert.equal(ep.ok, true);
+    assert.equal(ep.port, 8039);
+    assert.equal(ep.modelId, "mock-lfm-model");
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+  }
+
+  // Offline fallback
+  const fallback = await autoDiscoverEndpoint({ host: "127.0.0.1", ports: [8099] });
+  assert.equal(fallback.port, 8034);
+  assert.ok(fallback.url.includes("8034"));
 });
 
 test("Discovery: ripgrep file discovery extracts valid files", () => {

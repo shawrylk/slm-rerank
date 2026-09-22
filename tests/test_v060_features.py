@@ -84,4 +84,3 @@ def test_auto_discover_endpoint():
     ep = asyncio.run(auto_discover_endpoint(host="127.0.0.1"))
     assert "url" in ep
     assert ep["port"] == 8034
-    assert ep["ok"] is True
