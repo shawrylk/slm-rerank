@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "slm-rerank"
-version = "0.6.4"
+version = "0.6.5"
 description = "Model-Agnostic Wide Reranker with Two-Tier Hybrid Search, Context Stitching, and Ground-Truth Verification"
 readme = "README.md"
 requires-python = ">=3.9"

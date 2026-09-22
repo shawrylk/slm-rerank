@@ -80,7 +80,10 @@ def test_discover_candidate_files_with_ripgrep():
 
 
 def test_auto_discover_endpoint():
+    """No server answering must report failure, not a phantom :8034 endpoint."""
     import asyncio
-    ep = asyncio.run(auto_discover_endpoint(host="127.0.0.1"))
-    assert "url" in ep
-    assert ep["port"] == 8034
+    ep = asyncio.run(auto_discover_endpoint(host="127.0.0.1", ports=[8099], env={}))
+    assert ep["ok"] is False
+    assert ep["url"] is None
+    assert ep["port"] is None
+    assert "SLM_ENDPOINT" in ep["reason"]

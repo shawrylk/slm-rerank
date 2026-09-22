@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
+from .discovery import DEFAULT_HOST, resolve_endpoint_env, resolve_host_env
 
 try:
     import yaml
@@ -76,8 +77,7 @@ def resolve_endpoint_and_model(
     explicit_base_url = (
         cli_base_url
         or cli_endpoint
-        or os.environ.get("RERANKER_BASE_URL")
-        or os.environ.get("LFM_ENDPOINT")
+        or resolve_endpoint_env()  # SLM_ENDPOINT -> RERANKER_BASE_URL -> LFM_ENDPOINT
     )
     if explicit_base_url:
         return resolved_model, explicit_base_url
@@ -92,5 +92,12 @@ def resolve_endpoint_and_model(
 
     # Fallback to general base_url from config
     resolved_base_url = cfg.get("base_url")
+
+    # A host on its own is enough to reach a remote server, so build the default
+    # :8034 endpoint from it rather than letting the caller fall back to loopback.
+    if not resolved_base_url:
+        host = resolve_host_env()
+        if host != DEFAULT_HOST:
+            resolved_base_url = f"http://{host}:8034/v1"
 
     return resolved_model, resolved_base_url

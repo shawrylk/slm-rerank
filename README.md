@@ -38,6 +38,10 @@ The **Wide Reranker** is an ultra-high-throughput, prefill-dominant semantic fil
 ### 5. Multi-Port Auto-Discovery (8033–8040)
 - Scans active models across dedicated ports `8033..8040` (e.g. 8033 Qwen, 8034 LFM 2.5, 8035-8040 others) in parallel (< 100ms).
 - Seamlessly resolves target port based on requested model profile or active hardware.
+- **Scans ports on a single host, never the network.** The default host is loopback, so a
+  model server on *another* machine is found only when you name it — see
+  [Remote & Multi-Machine Setup](#remote--multi-machine-setup). When nothing answers,
+  discovery reports why instead of returning an endpoint that is not there.
 
 ### 6. Smart Ripgrep Candidate Discovery
 - Run `slm-rerank -q "query"` without file arguments; fast ripgrep lexical probing gathers top candidate files across massive repos in ~15ms.
@@ -101,6 +105,52 @@ ports 8033–8040 and returns ranked `file:line` citations plus a JSON candidate
 | `stub` | boolean | `false` | Attach AST Ghost Stubs to top results |
 | `dirty` | boolean | `false` | Bias toward git uncommitted/modified files |
 | `by_slice` | boolean | `false` | Group results by architectural vertical slice |
+
+---
+
+## Remote & Multi-Machine Setup
+
+Discovery probes **ports on one host**. Running the reranker on a laptop while the GPU box
+runs `llama-server` elsewhere means pointing it at that box explicitly — nothing is
+auto-detected across the network.
+
+On the machine serving the model, bind to all interfaces (not just loopback):
+
+```bash
+llama-server -m LFM2.5-8B-A1B-Q8_0.gguf --host 0.0.0.0 --port 8034
+```
+
+On the client machine, set one environment variable:
+
+```bash
+# Full endpoint — skips port scanning entirely
+export SLM_ENDPOINT=http://192.168.1.220:8034/v1
+
+# Or just the host — ports 8033-8040 are then scanned on that box
+export SLM_HOST=192.168.1.220
+```
+
+For Claude Code, put it in the MCP registration itself:
+
+```bash
+claude mcp add slm-reranker -e SLM_ENDPOINT=http://192.168.1.220:8034/v1 -- npx -y slm-rerank --mcp
+
+# Equivalent, scanning the remote port range instead of pinning one endpoint
+claude mcp add slm-reranker -- npx -y slm-rerank --mcp --host 192.168.1.220
+```
+
+### Environment Variables
+
+Both the Node and Python implementations read the same variables, in this order:
+
+| Purpose | Variables (highest precedence first) | Default |
+| --- | --- | --- |
+| Full endpoint URL | `SLM_ENDPOINT`, `RERANKER_BASE_URL`, `LFM_ENDPOINT` | *(unset)* |
+| Host to scan | `SLM_HOST`, `RERANKER_HOST` | `127.0.0.1` |
+
+A `--base-url` / `-e` argument beats both. A pinned endpoint URL beats `--host`, and is used
+as-is even when a specific `--model` is requested, on the assumption that you named the
+server deliberately.
 
 ---
 

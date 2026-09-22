@@ -5,7 +5,7 @@ import fs from "node:fs";
 import { parseArgs } from "node:util";
 import { Reranker } from "../src/client.mjs";
 import { prepareCandidates } from "../src/chunker.mjs";
-import { autoDiscoverEndpoint, discoverCandidateFiles } from "../src/discovery.mjs";
+import { autoDiscoverEndpoint, discoverCandidateFiles, resolveHostEnv } from "../src/discovery.mjs";
 import { groupBySlice } from "../src/boundary.mjs";
 import { startMcpServer } from "../src/mcp.mjs";
 
@@ -55,7 +55,7 @@ ripgrep/git auto-discovery to locate the top candidate files across the repo.
 }
 
 async function runNative(query, files, parsed) {
-  const host = parsed.values.host || process.env.SLM_HOST || "127.0.0.1";
+  const host = parsed.values.host || resolveHostEnv();
   const requestedModel = parsed.values.model || null;
   const withStub = parsed.values.stub || parsed.values.slice || false;
   const withContext = parsed.values["with-context"];
@@ -72,6 +72,10 @@ async function runNative(query, files, parsed) {
 
   if (!baseUrl) {
     const discovered = await autoDiscoverEndpoint({ host, requestedModel });
+    if (!discovered.url) {
+      console.error(`Error: ${discovered.reason}`);
+      process.exit(1);
+    }
     baseUrl = discovered.url;
     detectedPort = discovered.port;
     detectedModel = discovered.modelId;

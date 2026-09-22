@@ -5,6 +5,34 @@ import path from "node:path";
 export const SLM_PORT_RANGE = [8033, 8034, 8035, 8036, 8037, 8038, 8039, 8040];
 
 /**
+ * Endpoint and host environment variables, in precedence order.
+ * SLM_ENDPOINT/SLM_HOST are the canonical spellings; RERANKER_BASE_URL,
+ * LFM_ENDPOINT and RERANKER_HOST are the names the Python implementation has
+ * always read, and are honoured here so one variable configures either side.
+ */
+export const ENDPOINT_ENV_VARS = ["SLM_ENDPOINT", "RERANKER_BASE_URL", "LFM_ENDPOINT"];
+export const HOST_ENV_VARS = ["SLM_HOST", "RERANKER_HOST"];
+export const DEFAULT_HOST = "127.0.0.1";
+
+function firstEnvValue(names, env) {
+  for (const name of names) {
+    const value = env[name];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return null;
+}
+
+/** Full endpoint URL pinned via env, or null when none is set. */
+export function resolveEndpointEnv(env = process.env) {
+  return firstEnvValue(ENDPOINT_ENV_VARS, env);
+}
+
+/** Host to scan for model servers. Defaults to loopback. */
+export function resolveHostEnv(env = process.env) {
+  return firstEnvValue(HOST_ENV_VARS, env) || DEFAULT_HOST;
+}
+
+/**
  * Probe a single HTTP endpoint for model availability.
  * @param {string} host 
  * @param {number} port 
@@ -40,22 +68,37 @@ export async function probePort(host, port, timeoutMs = 250) {
  * Otherwise returns the first healthy port, preferring 8034 (LFM) and 8033 (Qwen).
  */
 export async function autoDiscoverEndpoint({
-  host = process.env.SLM_HOST || "127.0.0.1",
+  env = process.env,
+  host = resolveHostEnv(env),
   requestedModel = null,
   ports = SLM_PORT_RANGE,
   timeoutMs = 300
 } = {}) {
-  // If user provided a complete URL via env var, check if it's explicitly pinned
-  if (process.env.SLM_ENDPOINT && !requestedModel) {
-    return { url: process.env.SLM_ENDPOINT, modelId: "pinned-via-env", port: null, host };
+  // An explicitly pinned URL wins outright, including when a model was requested:
+  // the caller named the server, so we do not second-guess it by scanning loopback.
+  const pinned = resolveEndpointEnv(env);
+  if (pinned) {
+    return { url: pinned, modelId: "pinned-via-env", port: null, host, ok: true };
   }
 
   const probes = ports.map(port => probePort(host, port, timeoutMs));
   const results = (await Promise.all(probes)).filter(Boolean);
 
   if (!results.length) {
-    // Default fallback
-    return { url: `http://${host}:8034/v1`, modelId: "lfm-default-fallback", port: 8034, host };
+    // No phantom endpoint: returning a URL nothing answered on turns "no server
+    // here" into a connection error much later, which reads like a transport bug.
+    const range = `${ports[0]}-${ports[ports.length - 1]}`;
+    return {
+      url: null,
+      modelId: null,
+      port: null,
+      host,
+      ok: false,
+      reason: `No SLM model server answered on ${host} (ports ${range}). ` +
+        `Discovery only scans ports on a single host, never the network. ` +
+        `If the model runs on another machine, set SLM_ENDPOINT=http://<host>:8034/v1 ` +
+        `or SLM_HOST=<host>.`
+    };
   }
 
   if (requestedModel) {

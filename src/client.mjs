@@ -1,6 +1,7 @@
 // Reranker Client for Node.js: model-agnostic binary logprob evaluator with Ghost Stubs & Slice Boundaries
 import { detectSlice, groupBySlice } from "./boundary.mjs";
 import { generateGhostStub } from "./stubber.mjs";
+import { resolveEndpointEnv } from "./discovery.mjs";
 
 // Length-normalized sigmoid calibration (mirrors slm_rerank.adapters.ModelProfile.calibrate_score).
 const LENGTH_NORM_EXPONENT = 0.15;
@@ -69,7 +70,7 @@ function scanYesNo(entries) {
 
 export class Reranker {
   constructor(options = {}) {
-    this.baseUrl = (options.baseUrl || process.env.SLM_ENDPOINT || "http://localhost:8034/v1").replace(/\/+$/, "");
+    this.baseUrl = (options.baseUrl || resolveEndpointEnv() || "http://localhost:8034/v1").replace(/\/+$/, "");
 
     // llama.cpp serves native scoring on /completion at the server root, while the
     // OpenAI-compatible shim lives under /v1 — resolve both from whatever was supplied.

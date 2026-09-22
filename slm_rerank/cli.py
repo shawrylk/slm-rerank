@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import sys
 from pathlib import Path
@@ -13,10 +14,15 @@ from .boundary import detect_slice, group_by_slice
 from .cache import RerankCache
 from .client import LFMReranker
 from .config import load_config, resolve_endpoint_and_model
+from rich.console import Console
 from .discovery import auto_discover_endpoint, discover_candidate_files
 from .display import console, print_results
 from .stubber import generate_ghost_stub
 from .verifier import GroundTruthVerifier
+
+
+# rich writes to stdout by default; errors belong on stderr.
+error_console = Console(stderr=True)
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -57,8 +63,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--host",
         type=str,
-        default=os.environ.get("SLM_HOST", "127.0.0.1"),
-        help="Target server host (default: 127.0.0.1 or SLM_HOST)",
+        default=None,
+        help="Target server host (default: 127.0.0.1, or SLM_HOST/RERANKER_HOST)",
     )
     parser.add_argument(
         "--config",
@@ -211,16 +217,26 @@ def main() -> int:
         discovered_endpoint = asyncio.run(
             auto_discover_endpoint(host=args.host, requested_model=args.model)
         )
-        args.base_url = discovered_endpoint["url"]
-        args.endpoint = args.base_url
-        if not args.json and discovered_endpoint.get("ok"):
-            console.print(f"[dim]🎯 Auto-discovered port :{discovered_endpoint['port']} ({discovered_endpoint['model_id']})[/dim]")
+        if discovered_endpoint.get("url"):
+            args.base_url = discovered_endpoint["url"]
+            args.endpoint = args.base_url
+            if not args.json and discovered_endpoint.get("ok"):
+                console.print(f"[dim]🎯 Auto-discovered port :{discovered_endpoint['port']} ({discovered_endpoint['model_id']})[/dim]")
+        else:
+            # Nothing answered: stop here rather than scoring every chunk against
+            # an unreachable host and hanging on connect timeouts.
+            reason = discovered_endpoint.get("reason", "No SLM model server found.")
+            if args.json:
+                print(json.dumps({"error": reason}))
+            else:
+                error_console.print(f"[bold red]Error:[/bold red] {reason}")
+            return 1
 
     candidate_inputs = collect_candidate_inputs(args)
     if not candidate_inputs:
-        console.print("[bold red]Error:[/bold red] No candidates found or provided.", file=sys.stderr)
-        console.print("Usage: lfm-rerank --query \"auth\" src/*.py", file=sys.stderr)
-        console.print("Or piping: git ls-files | lfm-rerank --query \"auth\" --threshold 0.65", file=sys.stderr)
+        error_console.print("[bold red]Error:[/bold red] No candidates found or provided.")
+        error_console.print("Usage: lfm-rerank --query \"auth\" src/*.py")
+        error_console.print("Or piping: git ls-files | lfm-rerank --query \"auth\" --threshold 0.65")
         return 1
 
     verifier = GroundTruthVerifier(strict=args.strict)
@@ -256,7 +272,7 @@ def main() -> int:
         console.print("\n[yellow]Aborted by user.[/yellow]")
         return 130
     except Exception as e:
-        console.print(f"[bold red]Reranking failed:[/bold red] {e}", file=sys.stderr)
+        error_console.print(f"[bold red]Reranking failed:[/bold red] {e}")
         return 1
 
     # Attach slice tags to results

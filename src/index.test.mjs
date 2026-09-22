@@ -5,7 +5,7 @@ import { chunkFile } from "./chunker.mjs";
 import { stitchChunkContext } from "./stitcher.mjs";
 import { generateGhostStub } from "./stubber.mjs";
 import { detectSlice, groupBySlice } from "./boundary.mjs";
-import { autoDiscoverEndpoint, discoverCandidateFiles } from "./discovery.mjs";
+import { autoDiscoverEndpoint, discoverCandidateFiles, resolveEndpointEnv, resolveHostEnv } from "./discovery.mjs";
 import { handleMcpMessage } from "./mcp.mjs";
 import { Reranker } from "./client.mjs";
 
@@ -128,10 +128,51 @@ test("Discovery: discovers live ports in 8033-8040 range", async () => {
     await new Promise(resolve => server.close(resolve));
   }
 
-  // Offline fallback
-  const fallback = await autoDiscoverEndpoint({ host: "127.0.0.1", ports: [8099] });
-  assert.equal(fallback.port, 8034);
-  assert.ok(fallback.url.includes("8034"));
+  // Nothing answering must not yield a phantom endpoint
+  const missing = await autoDiscoverEndpoint({ host: "127.0.0.1", ports: [8099], env: {} });
+  assert.equal(missing.ok, false);
+  assert.equal(missing.url, null);
+  assert.equal(missing.port, null);
+  assert.match(missing.reason, /SLM_ENDPOINT/);
+  assert.match(missing.reason, /8099/);
+});
+
+test("Discovery: env resolution is shared and ordered", () => {
+  assert.equal(resolveHostEnv({}), "127.0.0.1");
+  assert.equal(resolveHostEnv({ RERANKER_HOST: "10.2.99.1" }), "10.2.99.1");
+  assert.equal(resolveHostEnv({ SLM_HOST: "a", RERANKER_HOST: "b" }), "a");
+  assert.equal(resolveHostEnv({ SLM_HOST: "   " }), "127.0.0.1");
+
+  assert.equal(resolveEndpointEnv({}), null);
+  assert.equal(resolveEndpointEnv({ LFM_ENDPOINT: "http://x:8034/v1" }), "http://x:8034/v1");
+  assert.equal(resolveEndpointEnv({ RERANKER_BASE_URL: "http://b/v1", LFM_ENDPOINT: "http://c/v1" }), "http://b/v1");
+  assert.equal(
+    resolveEndpointEnv({ SLM_ENDPOINT: " http://a/v1 ", RERANKER_BASE_URL: "http://b/v1" }),
+    "http://a/v1"
+  );
+});
+
+test("Discovery: a pinned endpoint wins even when a model is requested", async () => {
+  const ep = await autoDiscoverEndpoint({
+    env: { SLM_ENDPOINT: "http://192.168.1.220:8034/v1" },
+    requestedModel: "qwen",
+    ports: [8099]
+  });
+  assert.equal(ep.url, "http://192.168.1.220:8034/v1");
+  assert.equal(ep.ok, true);
+  assert.equal(ep.modelId, "pinned-via-env");
+});
+
+test("Reranker: baseUrl falls back to any endpoint env var", () => {
+  const saved = { ...process.env };
+  try {
+    delete process.env.SLM_ENDPOINT;
+    delete process.env.LFM_ENDPOINT;
+    process.env.RERANKER_BASE_URL = "http://192.168.1.220:8034/v1/";
+    assert.equal(new Reranker().baseUrl, "http://192.168.1.220:8034/v1");
+  } finally {
+    process.env = saved;
+  }
 });
 
 test("Discovery: ripgrep file discovery extracts valid files", () => {
@@ -151,7 +192,7 @@ test("MCP: initialize returns protocol version, server info and tool capability"
   assert.equal(res.jsonrpc, "2.0");
   assert.equal(res.id, 1);
   assert.equal(res.result.protocolVersion, "2024-11-05");
-  assert.deepEqual(res.result.serverInfo, { name: "slm-reranker", version: "0.6.4" });
+  assert.deepEqual(res.result.serverInfo, { name: "slm-reranker", version: "0.6.5" });
   assert.deepEqual(res.result.capabilities, { tools: {} });
 });
 
@@ -227,6 +268,29 @@ test("MCP: tools/call reranks injected candidates and returns a manifest", async
   assert.equal(manifest.candidates.length, 1);
   assert.equal(manifest.candidates[0].file, "x.ts");
   assert.equal(manifest.endpoint.port, 8034);
+});
+
+test("MCP: tools/call reports why no model server was found", async () => {
+  const reason = "No SLM model server answered on 127.0.0.1 (ports 8033-8040). Set SLM_ENDPOINT=http://<host>:8034/v1.";
+  const res = await handleMcpMessage(
+    {
+      jsonrpc: "2.0",
+      id: 7,
+      method: "tools/call",
+      params: { name: "rerank_codebase", arguments: { query: "payment flow", paths_or_globs: ["x.ts"] } }
+    },
+    {
+      Reranker: class { constructor() { throw new Error("must not score against a dead endpoint"); } },
+      resolveCandidatePaths: () => ["x.ts"],
+      prepareCandidates: () => [
+        { id: "x.ts:1-4", filePath: "x.ts", startLine: 1, endLine: 4, symbol: "charge", content: "charge()" }
+      ],
+      autoDiscoverEndpoint: async () => ({ url: null, port: null, modelId: null, ok: false, reason })
+    }
+  );
+
+  assert.equal(res.result.isError, true);
+  assert.equal(res.result.content[0].text, reason);
 });
 
 test("MCP: tools/call without a query returns invalid-params", async () => {

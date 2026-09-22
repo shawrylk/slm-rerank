@@ -11,12 +11,12 @@ import fs from "node:fs";
 import path from "node:path";
 import { Reranker } from "./client.mjs";
 import { prepareCandidates } from "./chunker.mjs";
-import { autoDiscoverEndpoint, discoverCandidateFiles, SLM_PORT_RANGE } from "./discovery.mjs";
+import { autoDiscoverEndpoint, discoverCandidateFiles, resolveHostEnv, SLM_PORT_RANGE } from "./discovery.mjs";
 import { groupBySlice } from "./boundary.mjs";
 
 export const MCP_PROTOCOL_VERSION = "2024-11-05";
 export const MCP_SERVER_NAME = "slm-reranker";
-export const MCP_SERVER_VERSION = "0.6.4";
+export const MCP_SERVER_VERSION = "0.6.5";
 
 const IGNORE_DIRS = new Set([
   ".git", "node_modules", "dist", "build", ".cache", ".next", "__pycache__",
@@ -279,7 +279,7 @@ async function callRerankTool(args = {}, context = {}) {
   }
 
   const cwd = context.cwd || process.cwd();
-  const host = context.host || process.env.SLM_HOST || "127.0.0.1";
+  const host = context.host || resolveHostEnv();
   const threshold = typeof args.threshold === "number" && Number.isFinite(args.threshold)
     ? args.threshold
     : 0.65;
@@ -317,6 +317,9 @@ async function callRerankTool(args = {}, context = {}) {
   }
 
   const endpoint = await discover({ host, ports: context.ports || SLM_PORT_RANGE });
+  if (!endpoint || !endpoint.url) {
+    return textResult(endpoint?.reason || `No SLM model server found on ${host}.`, true);
+  }
 
   const reranker = new RerankerImpl({ baseUrl: endpoint.url, model: context.model || "lfm", threshold });
   const result = await reranker.rerank(query, chunks, {
@@ -408,7 +411,7 @@ export async function handleMcpMessage(request, context = {}) {
  * Start the stdio MCP server. Reads newline-delimited JSON-RPC from stdin and
  * writes responses to stdout. Never writes anything else to stdout.
  */
-export function startMcpServer({ host = process.env.SLM_HOST || "127.0.0.1" } = {}) {
+export function startMcpServer({ host = resolveHostEnv() } = {}) {
   const context = { host };
   let buffer = "";
 

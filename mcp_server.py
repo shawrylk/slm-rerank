@@ -19,6 +19,7 @@ import httpx
 from mcp.server.mcpserver import MCPServer
 
 from slm_rerank import LFMReranker, QueryIntent
+from slm_rerank.discovery import resolve_endpoint_env, resolve_host_env
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
@@ -92,7 +93,12 @@ def resolve_candidate_paths(patterns_or_paths: List[str], max_files: int = 200) 
     return resolved
 
 
-DEFAULT_BASE_URL = os.environ.get("RERANKER_BASE_URL", "http://localhost:8034/v1")
+def _default_base_url() -> str:
+    """SLM_ENDPOINT/RERANKER_BASE_URL/LFM_ENDPOINT, else :8034 on SLM_HOST/RERANKER_HOST."""
+    return resolve_endpoint_env() or f"http://{resolve_host_env()}:8034/v1"
+
+
+DEFAULT_BASE_URL = _default_base_url()
 
 
 @mcp.tool()

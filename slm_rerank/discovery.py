@@ -17,6 +17,32 @@ import urllib.error
 
 SLM_PORT_RANGE = [8033, 8034, 8035, 8036, 8037, 8038, 8039, 8040]
 
+# Endpoint and host environment variables, in precedence order. SLM_* is the
+# canonical spelling shared with the Node implementation; RERANKER_*/LFM_* are
+# the historical Python names, kept so one variable configures either side.
+ENDPOINT_ENV_VARS = ("SLM_ENDPOINT", "RERANKER_BASE_URL", "LFM_ENDPOINT")
+HOST_ENV_VARS = ("SLM_HOST", "RERANKER_HOST")
+DEFAULT_HOST = "127.0.0.1"
+
+
+def _first_env_value(names, env: Optional[Dict[str, str]] = None) -> Optional[str]:
+    source = os.environ if env is None else env
+    for name in names:
+        value = source.get(name)
+        if value and value.strip():
+            return value.strip()
+    return None
+
+
+def resolve_endpoint_env(env: Optional[Dict[str, str]] = None) -> Optional[str]:
+    """Full endpoint URL pinned via env, or None when none is set."""
+    return _first_env_value(ENDPOINT_ENV_VARS, env)
+
+
+def resolve_host_env(env: Optional[Dict[str, str]] = None) -> str:
+    """Host to scan for model servers. Defaults to loopback."""
+    return _first_env_value(HOST_ENV_VARS, env) or DEFAULT_HOST
+
 
 def probe_port_sync(host: str, port: int, timeout: float = 0.25) -> Optional[Dict[str, Any]]:
     """Synchronously probe a single host:port/v1/models endpoint."""
@@ -50,28 +76,55 @@ async def probe_port_async(host: str, port: int, timeout: float = 0.25) -> Optio
 
 
 async def auto_discover_endpoint(
-    host: str = "127.0.0.1",
+    host: Optional[str] = None,
     requested_model: Optional[str] = None,
     ports: List[int] = SLM_PORT_RANGE,
     timeout: float = 0.30,
+    env: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """
-    Concurrently scan ports 8033-8040 for active SLM servers.
+    Concurrently scan ports 8033-8040 on a single host for active SLM servers.
     If requested_model is specified, matches against model ID (e.g. 'lfm', 'qwen').
     Otherwise prioritizes 8034 (LFM) and 8033 (Qwen), falling back to first responding port.
+
+    A URL pinned via SLM_ENDPOINT/RERANKER_BASE_URL/LFM_ENDPOINT wins outright.
+    When nothing answers, the result carries ok=False, url=None and a 'reason'.
     """
+    host = host or resolve_host_env(env)
+
+    # An explicitly pinned URL wins outright, including when a model was requested:
+    # the caller named the server, so we do not second-guess it by scanning loopback.
+    pinned = resolve_endpoint_env(env)
+    if pinned:
+        return {
+            "port": None,
+            "host": host,
+            "url": pinned,
+            "model_id": "pinned-via-env",
+            "ok": True,
+        }
+
     tasks = [probe_port_async(host, p, timeout) for p in ports]
     raw_results = await asyncio.gather(*tasks, return_exceptions=True)
     results = [r for r in raw_results if isinstance(r, dict) and r.get("ok")]
 
     if not results:
-        # Default fallback
+        # No phantom endpoint: handing back a URL nothing answered on turns
+        # "no server here" into a connection error much later, which reads
+        # like a transport bug rather than a configuration gap.
+        port_range = f"{ports[0]}-{ports[-1]}" if ports else "none"
         return {
-            "port": 8034,
+            "port": None,
             "host": host,
-            "url": f"http://{host}:8034/v1",
-            "model_id": "fallback-default-lfm",
+            "url": None,
+            "model_id": None,
             "ok": False,
+            "reason": (
+                f"No SLM model server answered on {host} (ports {port_range}). "
+                "Discovery only scans ports on a single host, never the network. "
+                "If the model runs on another machine, set "
+                "SLM_ENDPOINT=http://<host>:8034/v1 or SLM_HOST=<host>."
+            ),
         }
 
     if requested_model:
