@@ -101,7 +101,7 @@ from .models import (
 )
 from .verifier import GroundTruthVerifier
 
-__version__ = "0.5.0"
+__version__ = "0.6.3"
 
 __all__ = [
     "LFMReranker",

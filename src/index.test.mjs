@@ -7,6 +7,7 @@ import { generateGhostStub } from "./stubber.mjs";
 import { detectSlice, groupBySlice } from "./boundary.mjs";
 import { autoDiscoverEndpoint, discoverCandidateFiles } from "./discovery.mjs";
 import { handleMcpMessage } from "./mcp.mjs";
+import { Reranker } from "./client.mjs";
 
 test("Two-Tier Filter: bypass under 60 candidates", () => {
   const chunks = Array.from({ length: 40 }, (_, i) => ({
@@ -150,7 +151,7 @@ test("MCP: initialize returns protocol version, server info and tool capability"
   assert.equal(res.jsonrpc, "2.0");
   assert.equal(res.id, 1);
   assert.equal(res.result.protocolVersion, "2024-11-05");
-  assert.deepEqual(res.result.serverInfo, { name: "slm-reranker", version: "0.6.2" });
+  assert.deepEqual(res.result.serverInfo, { name: "slm-reranker", version: "0.6.3" });
   assert.deepEqual(res.result.capabilities, { tools: {} });
 });
 
@@ -236,4 +237,251 @@ test("MCP: tools/call without a query returns invalid-params", async () => {
     params: { name: "rerank_codebase", arguments: {} }
   });
   assert.equal(res.error.code, -32602);
+});
+
+test("Reranker: resolves /completion and /chat/completions from a /v1 base URL", () => {
+  const r = new Reranker({ baseUrl: "http://127.0.0.1:8034/v1/" });
+  assert.equal(r.baseUrl, "http://127.0.0.1:8034/v1");
+  assert.equal(r.completionUrl, "http://127.0.0.1:8034/completion");
+  assert.equal(r.chatUrl, "http://127.0.0.1:8034/v1/chat/completions");
+});
+
+test("Reranker: resolves both URLs from a bare host and from a /completion base URL", () => {
+  const bare = new Reranker({ baseUrl: "http://127.0.0.1:8034" });
+  assert.equal(bare.completionUrl, "http://127.0.0.1:8034/completion");
+  assert.equal(bare.chatUrl, "http://127.0.0.1:8034/v1/chat/completions");
+
+  const direct = new Reranker({ baseUrl: "http://127.0.0.1:8034/completion" });
+  assert.equal(direct.completionUrl, "http://127.0.0.1:8034/completion");
+  assert.equal(direct.chatUrl, "http://127.0.0.1:8034/v1/chat/completions");
+});
+
+test("extractLogprobs: parses llama.cpp completion_probabilities into a confident yes", () => {
+  const r = new Reranker();
+  const payload = {
+    completion_probabilities: [
+      {
+        content: "yes",
+        top_logprobs: [
+          { token: "yes", logprob: -0.02 },
+          { token: "no", logprob: -3.9 },
+          { token: "maybe", logprob: -7.1 }
+        ]
+      }
+    ]
+  };
+
+  const score = r.extractLogprobs(payload, { content: "function chargeCard() { return gateway.charge(); }" });
+  assert.ok(score > 0.7, `expected > 0.70, got ${score}`);
+  assert.ok(score <= 1.0);
+});
+
+test("extractLogprobs: llama.cpp completion_probabilities scores a confident no low", () => {
+  const r = new Reranker();
+  const payload = {
+    completion_probabilities: [
+      {
+        content: "no",
+        top_logprobs: [
+          { token: "no", logprob: -0.01 },
+          { token: "yes", logprob: -4.5 }
+        ]
+      }
+    ]
+  };
+
+  const score = r.extractLogprobs(payload, { content: "export const PI = 3.14;" });
+  assert.ok(score < 0.3, `expected < 0.30, got ${score}`);
+});
+
+test("extractLogprobs: parses OpenAI chat choices[0].logprobs.content[0].top_logprobs", () => {
+  const r = new Reranker();
+  const payload = {
+    choices: [
+      {
+        logprobs: {
+          content: [
+            {
+              token: "Yes",
+              logprob: -0.05,
+              top_logprobs: [
+                { token: "Yes", logprob: -0.05 },
+                { token: "No", logprob: -3.2 }
+              ]
+            }
+          ]
+        }
+      }
+    ]
+  };
+
+  const score = r.extractLogprobs(payload, { content: "async function handlePayment() {}" });
+  assert.ok(score > 0.7, `expected > 0.70, got ${score}`);
+});
+
+test("extractLogprobs: parses legacy completions top_logprobs token maps", () => {
+  const r = new Reranker();
+  const payload = {
+    choices: [{ logprobs: { top_logprobs: [{ " yes": -0.1, " no": -2.8, ".": -6.0 }] } }]
+  };
+
+  const score = r.extractLogprobs(payload, { content: "function route() {}" });
+  assert.ok(score > 0.7, `expected > 0.70, got ${score}`);
+});
+
+test("extractLogprobs: single-sided and absent yes/no signals", () => {
+  const r = new Reranker();
+  const chunk = { content: "function noop() {}" };
+
+  const yesOnly = r.extractLogprobs({ top_logprobs: [{ token: "yes", logprob: -0.3 }] }, chunk);
+  assert.ok(yesOnly > 0.9, `expected ~0.95, got ${yesOnly}`);
+
+  const noOnly = r.extractLogprobs({ top_logprobs: [{ token: "no", logprob: -0.3 }] }, chunk);
+  assert.ok(noOnly < 0.1, `expected ~0.05, got ${noOnly}`);
+
+  const neither = r.extractLogprobs({ top_logprobs: [{ token: "{", logprob: -0.1 }] }, chunk);
+  assert.equal(neither, 0.05);
+
+  assert.equal(r.extractLogprobs({}, chunk), 0.05);
+  assert.equal(r.extractLogprobs(null, chunk), 0.05);
+});
+
+test("scoreChunk: scores against llama.cpp /completion without touching the chat endpoint", async () => {
+  const r = new Reranker({ baseUrl: "http://127.0.0.1:8034/v1" });
+  const calls = [];
+  const originalFetch = globalThis.fetch;
+
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url, body: JSON.parse(init.body) });
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        completion_probabilities: [
+          { content: "yes", top_logprobs: [{ token: "yes", logprob: -0.01 }, { token: "no", logprob: -4.0 }] }
+        ]
+      })
+    };
+  };
+
+  try {
+    const res = await r.scoreChunk("payment flow", {
+      filePath: "src/pay.ts",
+      symbol: "charge",
+      startLine: 1,
+      endLine: 4,
+      content: "function charge() {}"
+    });
+
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, "http://127.0.0.1:8034/completion");
+    assert.equal(calls[0].body.n_predict, 1);
+    assert.equal(calls[0].body.n_probs, 10);
+    assert.deepEqual(calls[0].body.stop, ["<|im_end|>"]);
+    assert.ok(calls[0].body.prompt.includes("Respond only with yes or no."));
+    assert.equal(res.error, undefined);
+    assert.ok(res.score > 0.7, `expected > 0.70, got ${res.score}`);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("scoreChunk: falls back from /completion to /chat/completions on non-200", async () => {
+  const r = new Reranker({ baseUrl: "http://127.0.0.1:8034/v1" });
+  const calls = [];
+  const originalFetch = globalThis.fetch;
+
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url, body: JSON.parse(init.body) });
+    if (url.endsWith("/completion")) {
+      return { ok: false, status: 404, json: async () => ({}) };
+    }
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        choices: [
+          {
+            logprobs: {
+              content: [
+                { token: "yes", logprob: -0.02, top_logprobs: [{ token: "yes", logprob: -0.02 }, { token: "no", logprob: -3.5 }] }
+              ]
+            }
+          }
+        ]
+      })
+    };
+  };
+
+  try {
+    const res = await r.scoreChunk("payment flow", { filePath: "src/pay.ts", content: "function charge() {}" });
+
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0].url, "http://127.0.0.1:8034/completion");
+    assert.equal(calls[1].url, "http://127.0.0.1:8034/v1/chat/completions");
+    assert.equal(calls[1].body.max_tokens, 1);
+    assert.equal(calls[1].body.logprobs, true);
+    assert.equal(calls[1].body.top_logprobs, 10);
+    assert.equal(res.error, undefined);
+    assert.ok(res.score > 0.7, `expected > 0.70, got ${res.score}`);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("scoreChunk: falls back to chat on a /completion network error, and reports both failures", async () => {
+  const r = new Reranker({ baseUrl: "http://127.0.0.1:8034/v1" });
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+
+  globalThis.fetch = async url => {
+    calls.push(url);
+    if (url.endsWith("/completion")) throw new Error("ECONNREFUSED");
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ choices: [{ logprobs: { content: [{ top_logprobs: [{ token: "no", logprob: -0.01 }, { token: "yes", logprob: -5.0 }] }] } }] })
+    };
+  };
+
+  try {
+    const res = await r.scoreChunk("payment flow", { filePath: "src/pay.ts", content: "const x = 1;" });
+    assert.deepEqual(calls, ["http://127.0.0.1:8034/completion", "http://127.0.0.1:8034/v1/chat/completions"]);
+    assert.equal(res.error, undefined);
+    assert.ok(res.score < 0.3, `expected < 0.30, got ${res.score}`);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  globalThis.fetch = async () => {
+    throw new Error("ECONNREFUSED");
+  };
+
+  try {
+    const res = await r.scoreChunk("payment flow", { filePath: "src/pay.ts", content: "const x = 1;" });
+    assert.equal(res.score, 0.0);
+    assert.equal(res.error, "ECONNREFUSED");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("formatPrompt: emits the ChatML binary-evaluator prompt with file, line and symbol context", () => {
+  const r = new Reranker();
+  const prompt = r.formatPrompt("find the charge handler", {
+    filePath: "src/pay.ts",
+    symbol: "charge",
+    startLine: 10,
+    endLine: 20,
+    content: "function charge() {}"
+  });
+
+  assert.ok(prompt.startsWith("<|startoftext|><|im_start|>system\n"));
+  assert.ok(prompt.includes("You are a binary code retrieval evaluator."));
+  assert.ok(prompt.includes("Query: find the charge handler"));
+  assert.ok(prompt.includes("File: src/pay.ts\n"));
+  assert.ok(prompt.includes("Lines: 10-20\n"));
+  assert.ok(prompt.includes("Symbol: charge\n"));
+  assert.ok(prompt.includes("Respond only with yes or no.<|im_end|>"));
+  assert.ok(prompt.endsWith("<|im_start|>assistant\n<think>\n</think>\n"));
 });

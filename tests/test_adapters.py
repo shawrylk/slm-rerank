@@ -512,3 +512,28 @@ def test_live_server_8033_if_available():
 
     reranker = LFMReranker(endpoint="http://localhost:8033/v1")
     assert reranker.profile.name == "qwen"
+
+
+@pytest.mark.parametrize(
+    "profile_cls",
+    [ModelProfile, LFMProfile, QwenProfile, GemmaProfile, RWKVProfile, GenericOpenAIProfile],
+)
+def test_no_bare_newline_stop_token(profile_cls):
+    """A bare "\\n" stop token makes llama.cpp treat tokens like "{\\n" as a stop hit,
+    which drops completion_probabilities and collapses every score to 0.0."""
+    assert "\n" not in profile_cls.stop_tokens
+
+
+def test_lfm_prompt_asks_for_bare_yes_or_no():
+    prompt = LFMProfile().format_prompt(
+        query="charge handler",
+        chunk_content="function charge() {}",
+        file_path="src/pay.ts",
+        symbol="charge",
+        start_line=1,
+        end_line=4,
+    )
+
+    assert "Respond only with yes or no." in prompt
+    assert "Answer (yes/no):" not in prompt
+    assert prompt.endswith("<|im_start|>assistant\n<think>\n</think>\n")

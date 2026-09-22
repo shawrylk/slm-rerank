@@ -89,6 +89,9 @@ def resolve_candidate_paths(patterns_or_paths: List[str], max_files: int = 200) 
                     if len(resolved) >= max_files:
                         return resolved
 
+    return resolved
+
+
 DEFAULT_BASE_URL = os.environ.get("RERANKER_BASE_URL", "http://localhost:8034/v1")
 
 
