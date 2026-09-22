@@ -67,7 +67,7 @@ npm install -g slm-rerank
 ### Option B: Python (Rich Terminal Table & Local Hardware Server)
 
 ```bash
-cd /home/shawry/lfm-kit/reranker
+cd /home/shawry/Documents/GitHub/slm-rerank
 pip install -e . --break-system-packages
 ```
 

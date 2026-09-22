@@ -7,4 +7,4 @@ export { detectSlice, groupBySlice } from "./boundary.mjs";
 export { autoDiscoverEndpoint, discoverCandidateFiles, probePort, SLM_PORT_RANGE } from "./discovery.mjs";
 export { startMcpServer, handleMcpMessage } from "./mcp.mjs";
 
-export const VERSION = "0.6.3";
+export const VERSION = "0.6.4";

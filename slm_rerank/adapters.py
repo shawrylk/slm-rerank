@@ -614,7 +614,7 @@ class QwenProfile(ModelProfile):
             f"{test_guidance}"
             "Code:\n"
             f"{chunk_content}\n\n"
-            "Does this snippet contain the relevant code for the query? Answer (yes/no):<|im_end|>\n"
+            "Does this snippet contain the relevant code for the query? Respond only with yes or no.<|im_end|>\n"
             f"<|im_start|>assistant\n{think_suffix}"
         )
 
@@ -668,7 +668,7 @@ class GemmaProfile(ModelProfile):
             f"{test_guidance}"
             "Code:\n"
             f"{chunk_content}\n\n"
-            "Does this snippet contain the relevant code for the query? Answer (yes/no):<end_of_turn>\n"
+            "Does this snippet contain the relevant code for the query? Respond only with yes or no.<end_of_turn>\n"
             "<start_of_turn>model\n"
         )
 
@@ -679,7 +679,7 @@ class RWKVProfile(ModelProfile):
     name: str = "rwkv"
     default_base_url: str = "http://localhost:8000/v1"
     length_normalization_exponent: float = 0.10
-    stop_tokens: List[str] = ["\n\n", "User:"]
+    stop_tokens: List[str] = ["User:"]
 
     def format_prompt(
         self,
@@ -721,7 +721,7 @@ class RWKVProfile(ModelProfile):
             f"{test_guidance}"
             "Code:\n"
             f"{chunk_content}\n\n"
-            "Does this snippet contain the relevant code for the query? Answer (yes/no):\n\n"
+            "Does this snippet contain the relevant code for the query? Respond only with yes or no.\n\n"
             "Assistant: "
         )
 
@@ -776,7 +776,7 @@ class GenericOpenAIProfile(ModelProfile):
             f"{test_guidance}"
             "Code:\n"
             f"{chunk_content}\n\n"
-            "Does this snippet contain the relevant code for the query? Answer (yes/no):<|im_end|>\n"
+            "Does this snippet contain the relevant code for the query? Respond only with yes or no.<|im_end|>\n"
             "<|im_start|>assistant\n"
         )
 

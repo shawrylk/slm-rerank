@@ -151,7 +151,7 @@ test("MCP: initialize returns protocol version, server info and tool capability"
   assert.equal(res.jsonrpc, "2.0");
   assert.equal(res.id, 1);
   assert.equal(res.result.protocolVersion, "2024-11-05");
-  assert.deepEqual(res.result.serverInfo, { name: "slm-reranker", version: "0.6.3" });
+  assert.deepEqual(res.result.serverInfo, { name: "slm-reranker", version: "0.6.4" });
   assert.deepEqual(res.result.capabilities, { tools: {} });
 });
 

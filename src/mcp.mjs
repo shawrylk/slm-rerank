@@ -16,7 +16,7 @@ import { groupBySlice } from "./boundary.mjs";
 
 export const MCP_PROTOCOL_VERSION = "2024-11-05";
 export const MCP_SERVER_NAME = "slm-reranker";
-export const MCP_SERVER_VERSION = "0.6.3";
+export const MCP_SERVER_VERSION = "0.6.4";
 
 const IGNORE_DIRS = new Set([
   ".git", "node_modules", "dist", "build", ".cache", ".next", "__pycache__",

@@ -518,10 +518,34 @@ def test_live_server_8033_if_available():
     "profile_cls",
     [ModelProfile, LFMProfile, QwenProfile, GemmaProfile, RWKVProfile, GenericOpenAIProfile],
 )
-def test_no_bare_newline_stop_token(profile_cls):
-    """A bare "\\n" stop token makes llama.cpp treat tokens like "{\\n" as a stop hit,
-    which drops completion_probabilities and collapses every score to 0.0."""
-    assert "\n" not in profile_cls.stop_tokens
+def test_no_newline_bearing_stop_token(profile_cls):
+    """Any stop token containing a newline ("\\n", "\\n\\n", ...) makes llama.cpp treat
+    tokens like "{\\n" as a stop hit, which drops completion_probabilities and
+    collapses every score to 0.0. Scoring requests use max_tokens=1, so stop tokens
+    buy nothing and only risk suppressing the logprobs we need."""
+    offenders = [tok for tok in profile_cls.stop_tokens if "\n" in tok]
+    assert not offenders, f"{profile_cls.__name__} has newline-bearing stop tokens: {offenders!r}"
+
+
+@pytest.mark.parametrize(
+    "profile_cls",
+    [LFMProfile, QwenProfile, GemmaProfile, RWKVProfile, GenericOpenAIProfile],
+)
+def test_prompt_asks_for_bare_yes_or_no(profile_cls):
+    """"Answer (yes/no):" invites the model to open with punctuation, so the first
+    generated token is "(" or a newline rather than yes/no and the yes/no logprobs
+    fall outside the top-10. Every profile must use the directive phrasing."""
+    prompt = profile_cls().format_prompt(
+        query="charge handler",
+        chunk_content="function charge() {}",
+        file_path="src/pay.ts",
+        symbol="charge",
+        start_line=1,
+        end_line=4,
+    )
+
+    assert "Respond only with yes or no." in prompt
+    assert "Answer (yes/no):" not in prompt
 
 
 def test_lfm_prompt_asks_for_bare_yes_or_no():
