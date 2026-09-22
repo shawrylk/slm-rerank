@@ -5,18 +5,18 @@ Binned calibration table evaluating predicted post-hoc calibrated relevance prob
 
 | Probability Bucket $[P(yes)]$ | Sample Count | Empirical Positive Rate | Mean Predicted Prob | Calibration Error | Status |
 | :---: | :---: | :---: | :---: | :---: | :---: |
-| `0.0-0.1` | 313 | 6.7% | 0.0610 | 0.0061 | `WELL_CALIBRATED` |
-| `0.1-0.2` | 256 | 9.8% | 0.1446 | 0.0470 | `WELL_CALIBRATED` |
-| `0.2-0.3` | 93 | 24.7% | 0.2371 | 0.0102 | `WELL_CALIBRATED` |
-| `0.3-0.4` | 19 | 47.4% | 0.3377 | 0.1360 | `WELL_CALIBRATED` |
-| `0.4-0.5` | 6 | 66.7% | 0.4502 | 0.2164 | `ACCEPTABLE` |
-| `0.5-0.6` | 0 | — | — | — | `EMPTY_BIN` |
+| `0.0-0.1` | 356 | 5.1% | 0.0580 | 0.0074 | `WELL_CALIBRATED` |
+| `0.1-0.2` | 184 | 12.5% | 0.1453 | 0.0203 | `WELL_CALIBRATED` |
+| `0.2-0.3` | 63 | 39.7% | 0.2382 | 0.1586 | `ACCEPTABLE` |
+| `0.3-0.4` | 34 | 29.4% | 0.3481 | 0.0540 | `WELL_CALIBRATED` |
+| `0.4-0.5` | 13 | 30.8% | 0.4384 | 0.1307 | `WELL_CALIBRATED` |
+| `0.5-0.6` | 2 | 100.0% | 0.5168 | 0.4832 | `ACCEPTABLE` |
 | `0.6-0.7` | 0 | — | — | — | `EMPTY_BIN` |
 | `0.7-0.8` | 0 | — | — | — | `EMPTY_BIN` |
 | `0.8-0.9` | 0 | — | — | — | `EMPTY_BIN` |
 | `0.9-1.0` | 0 | — | — | — | `EMPTY_BIN` |
 
 ### Calibration Metrics Summary:
-- **Post-Hoc Calibrated Brier Score**: `0.0968` (Pre-calibration: `0.2532`)
-- **Post-Hoc Calibrated ECE**: `0.0273` (Pre-calibration: `0.3524`)
+- **Post-Hoc Calibrated Brier Score**: `0.0979` (Pre-calibration: `0.2213`)
+- **Post-Hoc Calibrated ECE**: `0.0320` (Pre-calibration: `0.3102`)
 - **Monotonicity**: Empirical positive rate exhibits monotonic progression aligned with predicted confidence.

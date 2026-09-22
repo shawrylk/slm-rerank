@@ -43,6 +43,10 @@ class CandidateChunk(BaseModel):
     token_est: int = Field(default=0, description="Estimated token count")
     content_hash: str = Field(default="", description="SHA-256 hash of content")
     is_test: bool = Field(default=False, description="Whether this chunk originates from a test file")
+    stitched_context: Optional[str] = Field(
+        default=None,
+        description="1-hop call-graph/type context prepended to the scoring prompt only (<= 150 tokens)",
+    )
 
 
 class CandidateManifestEntry(BaseModel):
@@ -81,6 +85,18 @@ class RerankResultItem(BaseModel):
     completion_tokens: int = 1
     duration_ms: float = 0.0
     metadata: Dict[str, Any] = Field(default_factory=dict)
+
+    # Utility Trap Resolution & Context Stitching (v0.5.0)
+    domain_hits: int = 0  # Distinct core domain entities matched anywhere in the chunk
+    structural_domain_hits: int = 0  # Domain entities matched in the symbol or file path
+    symptom_hits: int = 0  # Distinct symptom modifiers (crash, exception, ...) matched
+    matched_domain_entities: List[str] = Field(default_factory=list)
+    symbol_role: str = "UNKNOWN"  # PUBLIC_API | INTERNAL_HELPER | UNKNOWN
+    centrality_boosted: bool = False  # Architectural centrality boost applied
+    utility_penalized: bool = False  # Small internal helper penalty applied
+    utility_trap_demoted: bool = False  # Clamped below the best domain-aligned chunk
+    context_stitched: bool = False  # Scored with 1-hop stitched context
+    tier1_lexical_score: Optional[float] = None  # Tier-1 hybrid pre-filter score, if it ran
 
 
 class AmbiguityEvent(BaseModel):
@@ -138,6 +154,26 @@ class Telemetry(BaseModel):
     symbol_boosts_applied: int = 0
     margin_threshold_used: float = 0.15
     ambiguity_events: List[Dict[str, Any]] = Field(default_factory=list)
+
+    # Two-Tier Hybrid Search (v0.5.0)
+    tier1_applied: bool = False
+    tier1_candidates_in: int = 0
+    tier1_candidates_out: int = 0
+    tier1_reason: str = ""
+    full_evaluation: bool = True
+
+    # Call-Graph & Type Context Stitching (v0.5.0)
+    context_stitching_enabled: bool = False
+    chunks_context_stitched: int = 0
+    stitched_context_tokens: int = 0
+    max_stitched_context_tokens: int = 150
+
+    # Utility Trap Resolution (v0.5.0)
+    domain_entities: List[str] = Field(default_factory=list)
+    symptom_modifiers: List[str] = Field(default_factory=list)
+    centrality_boosts_applied: int = 0
+    utility_penalties_applied: int = 0
+    utility_trap_demotions: int = 0
 
 
 class RerankResponse(BaseModel):

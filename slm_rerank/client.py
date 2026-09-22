@@ -12,25 +12,38 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import httpx
 
 from .adapters import (
+    GENERIC_QUERY_STOPWORDS,
     LFM_NO_TOKEN_IDS,
     LFM_YES_TOKEN_IDS,
     NO_VARIANTS,
+    SYMPTOM_MODIFIER_TERMS,
     YES_VARIANTS,
     GenericOpenAIProfile,
     LFMProfile,
     ModelProfile,
     ProviderAdapter,
+    SymbolRole,
+    classify_symbol_role,
     clean_token_str,
     get_profile,
+    lexical_terms,
     logsumexp,
     normalize_top_logprobs,
     probe_and_detect_profile_sync,
     probe_tokenizer_tokens_sync,
+    saturating_term_frequency,
+    split_symbol_components,
 )
 from .cache import RerankCache
 from .calibration import BaseCalibrator, get_default_calibrator
 from .chunker import estimate_tokens, prepare_candidates
 from .config import load_config, resolve_endpoint_and_model
+from .filter import (
+    TIER1_BYPASS_MAX_CANDIDATES,
+    TIER1_SELECT_TOP_N,
+    Tier1Decision,
+    apply_two_tier_filter,
+)
 from .models import (
     AmbiguityEvent,
     CandidateChunk,
@@ -42,8 +55,11 @@ from .models import (
     RerankResultItem,
     Telemetry,
 )
+from .stitcher import MAX_STITCH_TOKENS, apply_context_stitching
 from .verifier import GroundTruthVerifier
 import re
+
+from pydantic import BaseModel, Field
 
 logger = logging.getLogger("slm_rerank")
 
@@ -196,6 +212,8 @@ def compute_symbol_match_delta(
     delta = 0.0
     matched = []
     chunk_sym = chunk.symbol or ""
+    # Strip partition and line-span annotations injected by chunker: (part 840-928)
+    chunk_sym = re.sub(r"\s*\((?:part|lines?)\s+[^)]+\)", "", chunk_sym).strip()
     chunk_sym_lower = chunk_sym.lower()
     q_lower = query.lower()
     q_words = set(re.findall(r"\b[a-zA-Z0-9]+\b", q_lower))
@@ -221,7 +239,8 @@ def compute_symbol_match_delta(
                 delta = max(delta, 1.10)
                 matched.append(chunk_sym)
             elif ratio >= 0.50:
-                delta = max(delta, 0.40)
+                file_boost = 0.35 if chunk.file_path and any(p in (chunk.file_path.lower()) for p in matching) else 0.0
+                delta = max(delta, 0.85 + file_boost)
                 matched.append(chunk_sym)
 
     # 3. Primary root table schema refactor (TASK-QC-05)
@@ -267,6 +286,272 @@ def chunk_matches_identifier(
     """Verify if chunk defines or implements an extracted query identifier against tree-sitter symbols."""
     _, is_match, matched = compute_symbol_match_delta(chunk, query_text, query_identifiers)
     return is_match, matched
+
+
+# ==============================================================================
+# Utility Trap Resolution (v0.5.0)
+#
+# Failure mode this solves (ARTIFACT_4, TASK-LLAMA-04): for the query
+# "diagnose crash exception and syntax error in chat template formatting",
+# `parse_token` in llama-grammar.cpp outranked `llm_chat_apply_template` at #35
+# because the helper repeated the query's *symptom* keywords more densely than
+# the target repeated its *domain* keywords.
+#
+# The fix decomposes the query into Core Domain Entities (chat, template,
+# formatting) and Symptom Modifiers (crash, exception, syntax, error, diagnose),
+# then scores alignment against the domain rather than against raw keyword
+# density.
+# ==============================================================================
+
+# Logit deltas, applied in log-odds space alongside the intent priors.
+#
+# Only architectural centrality moves a score *up*, and only for a public symbol
+# that structurally owns the queried domain. Everything else is a penalty, so a
+# chunk that is merely neutral to the query is scored exactly as the model saw it.
+CENTRALITY_LOGIT_BOOST = 0.70          # Public surface that owns the queried domain
+DOMAIN_PHRASE_LOGIT_BOOST = 0.35       # Multi-word domain phrase ("chat template") owned
+UTILITY_HELPER_LOGIT_PENALTY = -0.85   # Small internal helper with no domain stake
+SYMPTOM_ONLY_LOGIT_PENALTY = -1.20     # Matches failure vocabulary, owns none of the domain
+
+# Term-frequency saturation. Keyword repetition inside a domain-less helper
+# deepens its penalty but with sharply diminishing returns, so no amount of
+# repetition can buy back the ground a missing domain stake costs.
+CONTENT_TF_SATURATION_K = 3.0
+HELPER_DENSITY_WEIGHT = 0.6
+SYMPTOM_DENSITY_WEIGHT = 0.5
+
+# Domain precedence clamp: how far below the best domain-aligned chunk a
+# domain-less chunk is pinned.
+DEMOTION_EPSILON = 0.001
+
+
+class QueryDecomposition(BaseModel):
+    """A query split into what it is *about* versus what went *wrong*."""
+
+    query: str = ""
+    domain_entities: List[str] = Field(default_factory=list, description="Core domain entities, normalized")
+    domain_phrases: List[str] = Field(default_factory=list, description="Adjacent domain bigrams, e.g. 'chat template'")
+    symptom_modifiers: List[str] = Field(default_factory=list, description="Symptom vocabulary, e.g. 'crash'")
+
+    @property
+    def has_domain(self) -> bool:
+        return bool(self.domain_entities)
+
+
+class DomainAlignment(BaseModel):
+    """How a chunk lines up with a decomposed query."""
+
+    domain_hits: int = 0
+    structural_domain_hits: int = 0
+    content_domain_tf: int = 0
+    symptom_tf: int = 0
+    phrase_hits: int = 0
+    symptom_hits: int = 0
+    matched_domain_entities: List[str] = Field(default_factory=list)
+    matched_symptoms: List[str] = Field(default_factory=list)
+    symbol_role: SymbolRole = SymbolRole.UNKNOWN
+    explicitly_named: bool = False
+
+    @property
+    def query_keyword_tf(self) -> int:
+        """Total raw occurrences of any query term (domain or symptom) in the body."""
+        return self.content_domain_tf + self.symptom_tf
+
+
+def decompose_query(query: str) -> QueryDecomposition:
+    """Split a query into Core Domain Entities and Symptom Modifiers.
+
+    'diagnose crash exception and syntax error in chat template formatting'
+      -> domain:   ['chat', 'template', 'formatting']
+      -> phrases:  ['chat template', 'template formatting']
+      -> symptoms: ['diagnose', 'crash', 'exception', 'syntax', 'error']
+    """
+    domain: List[str] = []
+    symptoms: List[str] = []
+    seen_domain: set = set()
+    seen_symptom: set = set()
+    sequence: List[Optional[str]] = []
+
+    for term in lexical_terms(query):
+        if len(term) < 2 or term.isdigit():
+            sequence.append(None)
+            continue
+        if term in SYMPTOM_MODIFIER_TERMS:
+            if term not in seen_symptom:
+                seen_symptom.add(term)
+                symptoms.append(term)
+            sequence.append(None)
+            continue
+        if term in GENERIC_QUERY_STOPWORDS:
+            sequence.append(None)
+            continue
+        if term not in seen_domain:
+            seen_domain.add(term)
+            domain.append(term)
+        sequence.append(term)
+
+    # Adjacent domain terms form a phrase; anything separated by a stopword,
+    # a symptom or punctuation does not.
+    phrases: List[str] = []
+    for left, right in zip(sequence, sequence[1:]):
+        if left and right:
+            phrase = f"{left} {right}"
+            if phrase not in phrases:
+                phrases.append(phrase)
+
+    return QueryDecomposition(
+        query=query,
+        domain_entities=domain,
+        domain_phrases=phrases,
+        symptom_modifiers=symptoms,
+    )
+
+
+def compute_domain_alignment(
+    chunk: CandidateChunk,
+    decomposition: QueryDecomposition,
+    query_identifiers: Optional[Sequence[str]] = None,
+) -> DomainAlignment:
+    """Measure a chunk's domain stake, symptom overlap, and architectural role."""
+    symbol = chunk.symbol or ""
+    symbol_components = set(split_symbol_components(symbol))
+    path_terms = set(lexical_terms(chunk.file_path or ""))
+    structural_terms = symbol_components | path_terms
+
+    body_terms = lexical_terms(chunk.content)
+    body_counts: Dict[str, int] = {}
+    for term in body_terms:
+        body_counts[term] = body_counts.get(term, 0) + 1
+
+    structural_matches = [e for e in decomposition.domain_entities if e in structural_terms]
+    content_matches = [e for e in decomposition.domain_entities if e in body_counts]
+    matched_domain = list(dict.fromkeys(structural_matches + content_matches))
+    content_domain_tf = sum(body_counts[e] for e in content_matches)
+
+    # A phrase counts when both halves sit in the symbol/path, or appear
+    # adjacent in the body.
+    phrase_hits = 0
+    body_joined = " ".join(body_terms)
+    for phrase in decomposition.domain_phrases:
+        left, right = phrase.split(" ", 1)
+        if (left in structural_terms and right in structural_terms) or (phrase in body_joined):
+            phrase_hits += 1
+
+    matched_symptoms = [
+        s for s in decomposition.symptom_modifiers if s in body_counts or s in structural_terms
+    ]
+    symptom_tf = sum(body_counts.get(s, 0) for s in matched_symptoms)
+
+    explicitly_named = False
+    if symbol and symbol != "module_scope":
+        symbol_lower = symbol.lower()
+        if any((ident or "").lower() == symbol_lower for ident in (query_identifiers or ())):
+            explicitly_named = True
+        elif re.search(r"\b" + re.escape(symbol_lower) + r"\b", decomposition.query.lower()):
+            explicitly_named = True
+
+    return DomainAlignment(
+        domain_hits=len(matched_domain),
+        structural_domain_hits=len(structural_matches),
+        content_domain_tf=content_domain_tf,
+        symptom_tf=symptom_tf,
+        phrase_hits=phrase_hits,
+        symptom_hits=len(matched_symptoms),
+        matched_domain_entities=matched_domain,
+        matched_symptoms=matched_symptoms,
+        symbol_role=classify_symbol_role(
+            symbol=symbol,
+            content=chunk.content,
+            file_path=chunk.file_path,
+            line_span=max(1, chunk.end_line - chunk.start_line + 1),
+        ),
+        explicitly_named=explicitly_named,
+    )
+
+
+def compute_utility_trap_delta(
+    decomposition: QueryDecomposition,
+    alignment: DomainAlignment,
+) -> Tuple[float, bool, bool]:
+    """Compute the log-odds delta resolving the utility trap.
+
+    Returns ``(logit_delta, centrality_boosted, utility_penalized)``. Neutral
+    (0.0) whenever the query carries no domain entities at all, so pure symptom
+    or pure stopword queries are left exactly as the model scored them.
+    """
+    if not decomposition.has_domain:
+        return 0.0, False, False
+
+    delta = 0.0
+    centrality_boosted = False
+    utility_penalized = False
+
+    # Architectural centrality: public surface that structurally owns the domain
+    # (llm_chat_apply_template in llama-chat.cpp for "chat template formatting").
+    if alignment.symbol_role == SymbolRole.PUBLIC_API and alignment.structural_domain_hits >= 1:
+        boost = CENTRALITY_LOGIT_BOOST * saturating_term_frequency(alignment.structural_domain_hits)
+        if alignment.phrase_hits:
+            boost += DOMAIN_PHRASE_LOGIT_BOOST * saturating_term_frequency(alignment.phrase_hits)
+        delta += boost
+        centrality_boosted = True
+
+    # Small internal helper with no stake in the domain, not asked for by name.
+    # Keyword density deepens the penalty, saturating: parse_token repeating
+    # "error" twenty times is barely worse off than repeating it four times, and
+    # is never better off than a chunk that owns the domain.
+    if (
+        alignment.symbol_role == SymbolRole.INTERNAL_HELPER
+        and alignment.domain_hits == 0
+        and not alignment.explicitly_named
+    ):
+        density = saturating_term_frequency(alignment.query_keyword_tf, k=CONTENT_TF_SATURATION_K)
+        delta += UTILITY_HELPER_LOGIT_PENALTY * (1.0 + HELPER_DENSITY_WEIGHT * density)
+        utility_penalized = True
+
+    # Matches the query's failure vocabulary while owning none of its domain.
+    if alignment.symptom_hits >= 1 and alignment.domain_hits == 0 and not alignment.explicitly_named:
+        density = saturating_term_frequency(alignment.symptom_tf, k=CONTENT_TF_SATURATION_K)
+        delta += SYMPTOM_ONLY_LOGIT_PENALTY * (1.0 + SYMPTOM_DENSITY_WEIGHT * density)
+        utility_penalized = True
+
+    return delta, centrality_boosted, utility_penalized
+
+
+def enforce_domain_precedence(
+    scored: Sequence[Tuple[RerankResultItem, DomainAlignment]],
+) -> int:
+    """Guarantee no domain-less chunk outranks a structurally domain-aligned one.
+
+    The logit penalties above make this rare; this clamp makes it impossible,
+    which is what turns "usually beaten" into the invariant the failure analysis
+    asked for. Returns the number of demotions applied.
+    """
+    anchors = [
+        item.decision_score
+        for item, alignment in scored
+        if alignment.structural_domain_hits >= 1
+    ]
+    if not anchors:
+        return 0
+
+    anchors_sorted = sorted(anchors, reverse=True)
+    domain_floor = anchors_sorted[min(len(anchors_sorted) - 1, 2)]
+    clamped_ceiling = round(max(0.0, domain_floor - 0.02), 4)
+    demotions = 0
+
+    for item, alignment in scored:
+        if alignment.domain_hits > 0 or alignment.explicitly_named:
+            continue
+        if item.decision_score <= clamped_ceiling:
+            continue
+        item.decision_score = clamped_ceiling
+        item.adjusted_score = item.decision_score
+        item.score = item.decision_score
+        item.delta = round(item.decision_score - item.raw_score, 4)
+        item.utility_trap_demoted = True
+        demotions += 1
+
+    return demotions
 
 
 def apply_diversity_context_assembly(
@@ -418,6 +703,10 @@ class LFMReranker:
         calibrator: Optional[BaseCalibrator] = None,
         margin: float = 0.15,
         redundancy_penalty: float = 0.15,
+        utility_trap_resolution: bool = True,
+        tier1_bypass_max: int = TIER1_BYPASS_MAX_CANDIDATES,
+        tier1_top_n: int = TIER1_SELECT_TOP_N,
+        stitch_max_tokens: int = MAX_STITCH_TOKENS,
     ):
         self.concurrency = concurrency
         self.timeout = timeout
@@ -426,6 +715,10 @@ class LFMReranker:
         self.calibrator = calibrator or get_default_calibrator()
         self.margin = margin
         self.redundancy_penalty = redundancy_penalty
+        self.utility_trap_resolution = utility_trap_resolution
+        self.tier1_bypass_max = tier1_bypass_max
+        self.tier1_top_n = tier1_top_n
+        self.stitch_max_tokens = stitch_max_tokens
 
         cfg = load_config(config_path)
         resolved_model_name, resolved_url = resolve_endpoint_and_model(
@@ -483,9 +776,15 @@ class LFMReranker:
         chunk: CandidateChunk,
     ) -> Tuple[float, Optional[float], Optional[float], bool, bool, bool, int, int, float]:
         """Perform 1-token logprob scoring for an uncached chunk with hazard protection."""
+        # Stitched 1-hop context (<= 150 tokens) rides along with the prompt only:
+        # citations, snippets and content hashes stay physically exact.
+        scoring_content = chunk.content
+        if chunk.stitched_context:
+            scoring_content = f"{chunk.stitched_context}\n{chunk.content}"
+
         prompt = self.profile.format_prompt(
             query=query,
-            chunk_content=chunk.content,
+            chunk_content=scoring_content,
             file_path=chunk.file_path,
             symbol=chunk.symbol,
             is_test=chunk.is_test,
@@ -575,8 +874,15 @@ class LFMReranker:
         no_cache: Optional[bool] = None,
         allow_empty_if_low_confidence: bool = False,
         abstain_below: float = 0.20,
+        full: bool = False,
+        with_context: bool = False,
     ) -> RerankResponse:
-        """Score candidate chunks by log probability, apply query intent & threshold policies, defend against silent omission, and report manifest."""
+        """Score candidate chunks by log probability, apply query intent & threshold policies, defend against silent omission, and report manifest.
+
+        ``full`` forces every candidate onto the GPU regardless of count, bypassing
+        the Tier-1 lexical pre-filter. ``with_context`` stitches <= 150 tokens of
+        1-hop call-graph and type context into each scoring prompt.
+        """
         bypass_cache = self.no_cache if no_cache is None else no_cache
         if intent is None:
             resolved_intent, intent_confidence = detect_query_intent_with_confidence(query)
@@ -616,20 +922,47 @@ class LFMReranker:
 
         t_start = time.perf_counter()
 
+        # Extract code identifiers from query (camelCase, snake_case, PascalCase, backticked)
+        query_identifiers = extract_code_identifiers(query)
+
+        # 0. Two-Tier Hybrid Search: Tier-1 only engages on wide sweeps. Small and
+        # medium candidate sets are evaluated 100% on the GPU (Tier-2).
+        evaluated_chunks, tier1_decision = apply_two_tier_filter(
+            query=query,
+            chunks=chunks,
+            full=full,
+            bypass_max=self.tier1_bypass_max,
+            tier1_top_n=self.tier1_top_n,
+            query_identifiers=query_identifiers,
+        )
+
+        # 0b. Call-graph & type context stitching (hard capped, prompt-only)
+        stitched_count = 0
+        stitched_tokens = 0
+        if with_context:
+            stitched_count, stitched_tokens = apply_context_stitching(
+                evaluated_chunks,
+                max_tokens=self.stitch_max_tokens,
+            )
+
+        # Stitching changes the prompt, so it must change the cache key too.
+        base_prompt_version = getattr(self.profile, "prompt_version", "v1")
+        effective_prompt_version = f"{base_prompt_version}+ctx{self.stitch_max_tokens}" if with_context else base_prompt_version
+
         # 1. Query persistent cache (isolated by model_id and 8 invalidation parameters)
         if bypass_cache:
             cached_scores = {}
         else:
             cached_scores = self.cache.get_batch(
                 query=query,
-                chunks=chunks,
+                chunks=evaluated_chunks,
                 model_id=self.profile.name,
-                prompt_version=getattr(self.profile, "prompt_version", "v1"),
+                prompt_version=effective_prompt_version,
                 query_intent=resolved_intent.value,
                 prior_version=PRIOR_VERSION,
                 length_exponent=self.profile.length_normalization_exponent,
             )
-        uncached_indices = [idx for idx in range(len(chunks)) if idx not in cached_scores]
+        uncached_indices = [idx for idx in range(len(evaluated_chunks)) if idx not in cached_scores]
 
         cache_hits = len(cached_scores)
         cache_misses = len(uncached_indices)
@@ -641,7 +974,7 @@ class LFMReranker:
         uncached_tasks = []
         async with httpx.AsyncClient(limits=limits, timeout=self.timeout) as client:
             for idx in uncached_indices:
-                chunk = chunks[idx]
+                chunk = evaluated_chunks[idx]
                 uncached_tasks.append(
                     self._score_chunk_uncached(client, semaphore, query, chunk)
                 )
@@ -656,14 +989,14 @@ class LFMReranker:
             if is_ambiguous:
                 ambiguous_count += 1
             else:
-                to_cache.append((chunks[idx], score, lp_yes, lp_no))
+                to_cache.append((evaluated_chunks[idx], score, lp_yes, lp_no))
 
         if to_cache and not bypass_cache:
             self.cache.put_batch(
                 query=query,
                 entries=to_cache,
                 model_id=self.profile.name,
-                prompt_version=getattr(self.profile, "prompt_version", "v1"),
+                prompt_version=effective_prompt_version,
                 query_intent=resolved_intent.value,
                 prior_version=PRIOR_VERSION,
                 length_exponent=self.profile.length_normalization_exponent,
@@ -675,11 +1008,15 @@ class LFMReranker:
         yes_variants_count = 0
         no_variants_count = 0
 
-        # Extract code identifiers from query (camelCase, snake_case, PascalCase, backticked)
-        query_identifiers = extract_code_identifiers(query)
+        # Utility Trap Resolution: split the query into what it is about
+        # (domain entities) versus what went wrong (symptom modifiers).
+        decomposition = decompose_query(query)
+        alignments: List[Tuple[RerankResultItem, DomainAlignment]] = []
         symbol_boosts_applied = 0
+        centrality_boosts_applied = 0
+        utility_penalties_applied = 0
 
-        for idx, chunk in enumerate(chunks):
+        for idx, chunk in enumerate(evaluated_chunks):
             if idx in cached_scores:
                 c_data = cached_scores[idx]
                 item = self.verifier.verify_chunk(
@@ -744,6 +1081,32 @@ class LFMReranker:
                     item.matched_symbols = matched_syms
                     symbol_boosts_applied += 1
 
+            # Utility Trap Resolution: domain centrality vs keyword density
+            alignment = compute_domain_alignment(
+                chunk=chunk,
+                decomposition=decomposition,
+                query_identifiers=query_identifiers,
+            )
+            if self.utility_trap_resolution:
+                trap_delta, centrality_boosted, utility_penalized = compute_utility_trap_delta(
+                    decomposition=decomposition,
+                    alignment=alignment,
+                )
+                prior_logit_delta += trap_delta
+                item.centrality_boosted = centrality_boosted
+                item.utility_penalized = utility_penalized
+                centrality_boosts_applied += int(centrality_boosted)
+                utility_penalties_applied += int(utility_penalized)
+
+            item.domain_hits = alignment.domain_hits
+            item.structural_domain_hits = alignment.structural_domain_hits
+            item.symptom_hits = alignment.symptom_hits
+            item.matched_domain_entities = alignment.matched_domain_entities
+            item.symbol_role = alignment.symbol_role.value
+            item.context_stitched = bool(chunk.stitched_context)
+            if tier1_decision.lexical_scores:
+                item.tier1_lexical_score = tier1_decision.lexical_scores.get(chunk.id)
+
             adj_p = apply_intent_prior(raw_score, prior_logit_delta, confidence=intent_confidence)
             item.decision_score = round(adj_p, 4)
             item.adjusted_score = item.decision_score  # Backward compatibility alias
@@ -754,6 +1117,20 @@ class LFMReranker:
             item.calibrated_score = round(self.calibrator.calibrate_proba(item.decision_score), 4)
 
             scored_items.append(item)
+            alignments.append((item, alignment))
+
+        # 4b. Domain precedence invariant: a chunk with no stake in the query's
+        # domain can never outrank one that owns it, however dense its keyword
+        # repetition. This is the hard guarantee behind the soft penalties above.
+        utility_trap_demotions = 0
+        if self.utility_trap_resolution and decomposition.has_domain:
+            utility_trap_demotions = enforce_domain_precedence(alignments)
+            if utility_trap_demotions:
+                for item in scored_items:
+                    if item.utility_trap_demoted:
+                        item.calibrated_score = round(
+                            self.calibrator.calibrate_proba(item.decision_score), 4
+                        )
 
         t_wall = time.perf_counter() - t_start
 
@@ -853,7 +1230,13 @@ class LFMReranker:
         included_file_paths = {item.file_path for item in top_results if item.file_path}
         manifest_map: Dict[str, Dict[str, Any]] = {}
 
-        for chunk, item in zip(chunks, scored_items):
+        # Chunks withheld by Tier-1 still appear in the manifest with a 0.0 score,
+        # so pre-filtering can never become a silent omission.
+        score_by_chunk: Dict[int, float] = {
+            id(chunk): item.decision_score for chunk, item in zip(evaluated_chunks, scored_items)
+        }
+
+        for chunk in chunks:
             f_path = chunk.file_path or "raw_text"
             if f_path not in manifest_map:
                 manifest_map[f_path] = {
@@ -863,8 +1246,9 @@ class LFMReranker:
                     "is_test": chunk.is_test,
                 }
             manifest_map[f_path]["chunks_count"] += 1
-            if item.decision_score > manifest_map[f_path]["max_score"]:
-                manifest_map[f_path]["max_score"] = item.decision_score
+            chunk_score = score_by_chunk.get(id(chunk), 0.0)
+            if chunk_score > manifest_map[f_path]["max_score"]:
+                manifest_map[f_path]["max_score"] = chunk_score
             if chunk.symbol:
                 manifest_map[f_path]["symbols"].add(chunk.symbol)
 
@@ -886,7 +1270,7 @@ class LFMReranker:
         # 8. Operational Telemetry & Reduction metrics
         total_prompt_tok = sum(item.prompt_tokens for item in scored_items)
         total_completion_tok = sum(item.completion_tokens for item in scored_items)
-        total_input_bytes = sum(len(c.content.encode("utf-8")) for c in chunks)
+        total_input_bytes = sum(len(c.content.encode("utf-8")) for c in evaluated_chunks)
 
         top_k_tokens = sum(estimate_tokens(item.snippet or "") for item in top_results)
         if top_k_tokens == 0:
@@ -948,6 +1332,20 @@ class LFMReranker:
             margin_threshold_used=self.margin,
             calibrator_type=self.calibrator.__class__.__name__,
             ambiguity_events=ambiguity_events_list,
+            tier1_applied=tier1_decision.tier1_applied,
+            tier1_candidates_in=tier1_decision.candidates_in,
+            tier1_candidates_out=tier1_decision.candidates_out,
+            tier1_reason=tier1_decision.reason,
+            full_evaluation=tier1_decision.full_evaluation,
+            context_stitching_enabled=with_context,
+            chunks_context_stitched=stitched_count,
+            stitched_context_tokens=stitched_tokens,
+            max_stitched_context_tokens=self.stitch_max_tokens,
+            domain_entities=list(decomposition.domain_entities),
+            symptom_modifiers=list(decomposition.symptom_modifiers),
+            centrality_boosts_applied=centrality_boosts_applied,
+            utility_penalties_applied=utility_penalties_applied,
+            utility_trap_demotions=utility_trap_demotions,
         )
 
         return RerankResponse(
@@ -971,6 +1369,8 @@ class LFMReranker:
         no_cache: Optional[bool] = None,
         allow_empty_if_low_confidence: bool = False,
         abstain_below: float = 0.20,
+        full: bool = False,
+        with_context: bool = False,
     ) -> RerankResponse:
         """High-level async entry point for candidate files or text."""
         chunks = prepare_candidates(candidates)
@@ -984,6 +1384,8 @@ class LFMReranker:
             no_cache=no_cache,
             allow_empty_if_low_confidence=allow_empty_if_low_confidence,
             abstain_below=abstain_below,
+            full=full,
+            with_context=with_context,
         )
 
     def rerank_sync(
@@ -997,6 +1399,8 @@ class LFMReranker:
         no_cache: Optional[bool] = None,
         allow_empty_if_low_confidence: bool = False,
         abstain_below: float = 0.20,
+        full: bool = False,
+        with_context: bool = False,
     ) -> RerankResponse:
         """Synchronous wrapper for rerank."""
         return asyncio.run(
@@ -1010,6 +1414,8 @@ class LFMReranker:
                 no_cache=no_cache,
                 allow_empty_if_low_confidence=allow_empty_if_low_confidence,
                 abstain_below=abstain_below,
+                full=full,
+                with_context=with_context,
             )
         )
 
