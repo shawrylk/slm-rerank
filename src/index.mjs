@@ -1,3 +1,4 @@
+import { createRequire } from "node:module";
 export { Reranker } from "./client.mjs";
 export { applyTwoTierFilter, computeLexicalScore, getGitDiffFiles } from "./filter.mjs";
 export { chunkFile, prepareCandidates } from "./chunker.mjs";
@@ -18,4 +19,4 @@ export {
 export { expandQuery, formatExpansionPrompt, parseExpansionText } from "./expander.mjs";
 export { startMcpServer, handleMcpMessage } from "./mcp.mjs";
 
-export const VERSION = "0.7.0";
+export const VERSION = createRequire(import.meta.url)("../package.json").version;

@@ -15,14 +15,17 @@ const round4 = x => Math.round(x * 10000) / 10000;
 
 /**
  * results[i] is the model's result for the chunk whose lexical score is lexicalScores[i].
+ * population is the set a chunk is judged against: a caller that scores only the head of the
+ * lexical order passes the lexical scores of every candidate, or the head is judged against itself.
  * Returns new results: `score` is fused, `rawScore` stays the model's own score.
  */
-export function fuseLexicalPrior(results, lexicalScores) {
+export function fuseLexicalPrior(results, lexicalScores, population = lexicalScores) {
   const n = lexicalScores.length;
   if (!n || n !== results.length) return results;
+  const pool = population.length ? population : lexicalScores;
 
-  const mean = lexicalScores.reduce((sum, x) => sum + x, 0) / n;
-  const sd = Math.sqrt(lexicalScores.reduce((sum, x) => sum + (x - mean) ** 2, 0) / n);
+  const mean = pool.reduce((sum, x) => sum + x, 0) / pool.length;
+  const sd = Math.sqrt(pool.reduce((sum, x) => sum + (x - mean) ** 2, 0) / pool.length);
   const spread = Math.max(sd, LEXICAL_SPREAD_FLOOR);
 
   return results.map((result, i) => {
