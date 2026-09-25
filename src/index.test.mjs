@@ -21,6 +21,9 @@ import { handleMcpMessage } from "./mcp.mjs";
 import { Reranker } from "./client.mjs";
 import { expandQuery, formatExpansionPrompt, parseExpansionText } from "./expander.mjs";
 import { containsTerm, termKeys, tokenKeys } from "./lexical.mjs";
+import { fuseLexicalPrior } from "./fusion.mjs";
+import { VERSION } from "./index.mjs";
+import { createRequire } from "node:module";
 
 test("Two-Tier Filter: bypass under 60 candidates", () => {
   const chunks = Array.from({ length: 40 }, (_, i) => ({
@@ -875,4 +878,27 @@ test("Reranker: a lexical difference inside the noise keeps the model order", as
     const res = await r.rerank("share", [a, b]);
     assert.deepEqual(res.results.map(x => x.chunk.id), ["b", "a"]);
   });
+});
+
+test("Fusion: a caller that scores only the head can judge it against every candidate", () => {
+  const head = [{ rawScore: 0.56, score: 0.56 }, { rawScore: 0.2, score: 0.2 }];
+  const headLexical = [32, 41];
+  const everyCandidate = [41, 32, 5, 4, 3, 3, 2, 2, 1, 1];
+
+  const [againstHead] = fuseLexicalPrior(head, headLexical);
+  const [againstAll] = fuseLexicalPrior(head, headLexical, everyCandidate);
+
+  assert.ok(againstAll.score > 0.65, `a strong match among all candidates should pass: ${againstAll.score}`);
+  assert.ok(againstHead.score < head[0].rawScore, `among the head alone it is below average: ${againstHead.score}`);
+});
+
+test("Fusion: the default population is the scored set, as rerank() uses it", () => {
+  const results = [{ rawScore: 0.4, score: 0.4 }, { rawScore: 0.7, score: 0.7 }, { rawScore: 0.1, score: 0.1 }];
+  const lexical = [20, 5, 1];
+  assert.deepEqual(fuseLexicalPrior(results, lexical), fuseLexicalPrior(results, lexical, lexical));
+});
+
+test("VERSION is the version in package.json", () => {
+  const { version } = createRequire(import.meta.url)("../package.json");
+  assert.equal(VERSION, version);
 });
