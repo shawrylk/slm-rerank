@@ -1,6 +1,6 @@
 {
   "name": "slm-rerank",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "type": "module",
   "description": "Model-Agnostic Semantic Wide Reranker with 1-Token Logprob Scoring & AST Chunking",
   "license": "MIT",
