@@ -1,6 +1,7 @@
 export { Reranker } from "./client.mjs";
 export { applyTwoTierFilter, computeLexicalScore, getGitDiffFiles } from "./filter.mjs";
 export { chunkFile, prepareCandidates } from "./chunker.mjs";
+export { fuseLexicalPrior } from "./fusion.mjs";
 export { stitchChunkContext } from "./stitcher.mjs";
 export { generateGhostStub } from "./stubber.mjs";
 export { detectSlice, groupBySlice } from "./boundary.mjs";

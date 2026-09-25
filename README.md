@@ -64,6 +64,15 @@ The **Wide Reranker** is an ultra-high-throughput, prefill-dominant semantic fil
 ### 8. Architecture-Aware Boundary Slicing (`--by-slice`)
 - Automatically clusters reranked code by architectural domain slice (`features/<slice>`, `modules/<slice>`, `packages/<slice>`).
 
+### 9. Lexical Prior on the Final Score
+- Tier-1 scores every candidate lexically. A query term that names the file or a symbol it
+  declares counts most, then a directory match, then mentions in the body.
+- The final `score` adds that evidence to the model's verdict in logit space:
+  `logit(score) = logit(rawScore) + z`. Here `z` is the chunk's lexical score, standardized
+  over the scored chunks and clipped to ±3. A spread below 3 points counts as noise.
+- `rawScore` stays the model's own score, and a chunk the model could not score stays at 0.
+- The prior costs no model call.
+
 ---
 
 ## Installation & Quickstart
