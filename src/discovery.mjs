@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { containsTerm, termKeys, tokenKeys } from "./lexical.mjs";
 
 export const SLM_PORT_RANGE = [8033, 8034, 8035, 8036, 8037, 8038, 8039, 8040];
 
@@ -299,10 +300,20 @@ export function discoverCandidateFiles(query, { cwd = process.cwd(), limit = 60,
     return scored.get(file);
   };
 
+  // A path term is a whole token: "share" is not the shared/ directory, "lay" is not replay.
+  // A stem whose keys its root already covers (creat after created) is not counted twice.
+  const covered = new Set();
+  const pathTerms = [];
+  for (const term of terms) {
+    const keys = termKeys(term);
+    if (keys.every(key => covered.has(key))) continue;
+    keys.forEach(key => covered.add(key));
+    pathTerms.push([term, keys]);
+  }
   for (const file of repoFiles) {
-    const lower = file.toLowerCase();
-    for (const term of terms) {
-      if (lower.includes(term)) entryFor(file).pathTerms.add(term);
+    const fileKeys = tokenKeys(file.replace(/\.[^./]+$/, ""));
+    for (const [term, keys] of pathTerms) {
+      if (containsTerm(fileKeys, keys)) entryFor(file).pathTerms.add(term);
     }
   }
   for (const [file, matchedTerms] of bodyHits) {

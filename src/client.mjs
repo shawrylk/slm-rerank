@@ -2,6 +2,7 @@
 import { detectSlice, groupBySlice } from "./boundary.mjs";
 import { generateGhostStub } from "./stubber.mjs";
 import { resolveEndpointEnv } from "./discovery.mjs";
+import { fuseLexicalPrior } from "./fusion.mjs";
 
 // Length-normalized sigmoid calibration (mirrors slm_rerank.adapters.ModelProfile.calibrate_score).
 const LENGTH_NORM_EXPONENT = 0.15;
@@ -237,18 +238,19 @@ export class Reranker {
 
     // Apply Tier-1 hybrid pre-filter (with git-diff biasing support)
     const { applyTwoTierFilter } = await import("./filter.mjs");
-    const { retained, tier1Applied, reason } = applyTwoTierFilter(chunks, query, { full, gitDiff, dirtyOnly });
+    const { retained, lexicalScores, tier1Applied, reason } = applyTwoTierFilter(chunks, query, { full, gitDiff, dirtyOnly });
 
     // Concurrently score chunks in slots
-    const results = [];
+    const scored = [];
     for (let i = 0; i < retained.length; i += this.concurrency) {
       const batch = retained.slice(i, i + this.concurrency);
       const batchResults = await Promise.all(
         batch.map(chunk => this.scoreChunk(query, chunk, withContext))
       );
-      results.push(...batchResults);
+      scored.push(...batchResults);
     }
 
+    const results = fuseLexicalPrior(scored, lexicalScores);
     results.sort((a, b) => b.score - a.score);
 
     const filtered = results.filter(r => r.score >= threshold);

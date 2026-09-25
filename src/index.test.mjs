@@ -20,6 +20,7 @@ import {
 import { handleMcpMessage } from "./mcp.mjs";
 import { Reranker } from "./client.mjs";
 import { expandQuery, formatExpansionPrompt, parseExpansionText } from "./expander.mjs";
+import { containsTerm, termKeys, tokenKeys } from "./lexical.mjs";
 
 test("Two-Tier Filter: bypass under 60 candidates", () => {
   const chunks = Array.from({ length: 40 }, (_, i) => ({
@@ -701,4 +702,177 @@ test("formatPrompt: emits the ChatML binary-evaluator prompt with file, line and
   assert.ok(prompt.includes("Symbol: charge\n"));
   assert.ok(prompt.includes("Respond only with yes or no.<|im_end|>"));
   assert.ok(prompt.endsWith("<|im_start|>assistant\n<think>\n</think>\n"));
+});
+
+test("Lexical: a term matches whole tokens, never a substring of another word", () => {
+  const has = (text, word) => containsTerm(tokenKeys(text), termKeys(word));
+
+  // every feature has a shared/ directory; it is not a share
+  assert.equal(has("src/features/photos/shared/queries", "share"), false);
+  assert.equal(has("src/features/sharing/slices/create-share", "share"), true);
+  assert.equal(has("SharePhotosDialog", "share"), true);
+  assert.equal(has("shares", "share"), true);
+
+  // the verb form in a query reaches the base form in code
+  assert.equal(has("createShare", "created"), true);
+  assert.equal(has("deleteFolder", "delete"), true);
+  assert.equal(has("blackboard/slices/folders", "folder"), true);
+  assert.equal(has("runMigrate", "migration"), true);
+
+  // short words stay short
+  assert.equal(has("mobile-sync/slices/run-replay", "lay"), false);
+  assert.equal(has("patterns/layouts/overlay-placement", "lay"), false);
+  assert.equal(has("application/ports/storage", "app"), false);
+  assert.equal(has("shell/chrome/app-header", "app"), true);
+
+  // a query word written as one word still meets a camelCase identifier
+  assert.equal(has("const store = openIndexedDB();", "indexeddb"), true);
+  assert.equal(has("<ToolBar />", "toolbar"), true);
+});
+
+test("Discovery: a path term is a whole token, so a shared/ directory is not a share", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "slm-tokens-"));
+  try {
+    for (const feature of ["audit", "photos", "pins"]) {
+      fs.mkdirSync(path.join(dir, "src", "features", feature, "shared"), { recursive: true });
+      fs.writeFileSync(path.join(dir, "src", "features", feature, "shared", "queries.ts"), "export const rows = [];\n");
+    }
+    fs.mkdirSync(path.join(dir, "src", "features", "sharing", "slices"), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, "src", "features", "sharing", "slices", "create-share.ts"),
+      "export function mint(input) { return input; }\n"
+    );
+    const git = (...args) => spawnSync("git", args, { cwd: dir, encoding: "utf-8" });
+    git("init", "-q", ".");
+    git("add", "-A");
+    git("-c", "user.email=t@example.com", "-c", "user.name=test", "commit", "-qm", "fixture");
+
+    const files = discoverCandidateFiles("share", { cwd: dir });
+    assert.equal(files[0], "src/features/sharing/slices/create-share.ts", `ranked: ${files.join(", ")}`);
+    assert.ok(!files.some(f => f.includes("/shared/")), `a shared/ file matched "share": ${files.join(", ")}`);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Two-Tier Filter: a small candidate set still comes back in lexical order", () => {
+  const frame = { id: "frame", filePath: "src/ui/layout/content-frame.tsx", symbol: "ContentFrame", content: "export function ContentFrame() { return null; }" };
+  const header = { id: "header", filePath: "src/shell/chrome/app-header.tsx", symbol: "AppHeader", content: "export function AppHeader() { return null; }" };
+
+  const res = applyTwoTierFilter([frame, header], "mobile app header", {});
+  assert.equal(res.tier1Applied, false);
+  assert.equal(res.retained.length, 2);
+  assert.equal(res.retained[0].id, "header", "a prompt hook scores only the head, so the head must be the best lexical match");
+});
+
+test("Two-Tier Filter: a shared/ chunk does not outrank the chunk named after the share", () => {
+  const filler = Array.from({ length: 70 }, (_, i) => ({
+    id: `filler_${i}`, filePath: `src/misc/file_${i}.ts`, symbol: `f${i}`, content: "const x = 1;"
+  }));
+  const shared = {
+    id: "shared", filePath: "src/features/photos/shared/types.ts", symbol: "SharedRow",
+    content: "export interface SharedRow {}\n// shared by the shared queries in shared/"
+  };
+  const share = {
+    id: "share", filePath: "src/features/sharing/slices/create-share.ts", symbol: "createShare",
+    content: "export function createShare() {}"
+  };
+
+  const res = applyTwoTierFilter([...filler, shared, share], "where a share is created", {});
+  assert.equal(res.tier1Applied, true);
+  assert.equal(res.retained[0].id, "share");
+  assert.ok(res.retained.indexOf(shared) === -1 || res.retained.indexOf(shared) > 0);
+});
+
+test("Two-Tier Filter: every name a chunk declares counts, not only its first", () => {
+  const panels = {
+    id: "panels", filePath: "src/ui/explorer/explorer-panels.tsx", symbol: "Menu",
+    content: "type Menu = string;\nexport function ExplorerHeader() { return null; }"
+  };
+  const workspace = {
+    id: "workspace", filePath: "src/ui/explorer/workspace-explorer.tsx", symbol: "WorkspaceExplorer",
+    content: "export function WorkspaceExplorer() { /* header, header, header */ return null; }"
+  };
+
+  const res = applyTwoTierFilter([workspace, panels], "explorer header", {});
+  assert.equal(res.retained[0].id, "panels");
+});
+
+// A fake llama.cpp /completion endpoint whose yes/no logprobs depend on the file in the prompt.
+function withModelVerdicts(verdicts, run) {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    const { prompt } = JSON.parse(init.body);
+    const file = Object.keys(verdicts).find(f => prompt.includes(`File: ${f}\n`));
+    const verdict = verdicts[file];
+    if (!verdict) throw new Error("ECONNREFUSED");
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        completion_probabilities: [{ top_logprobs: [{ token: "yes", logprob: verdict.yes }, { token: "no", logprob: verdict.no }] }]
+      })
+    };
+  };
+  return run().finally(() => { globalThis.fetch = originalFetch; });
+}
+
+test("Reranker: a chunk the query names overtakes a distractor the model scores higher", async () => {
+  const answer = {
+    id: "answer", filePath: "src/features/sharing/slices/create-share.ts", startLine: 1, endLine: 3,
+    symbol: "createShare", content: "1: export function createShare() { return mint(); }"
+  };
+  const distractor = {
+    id: "distractor", filePath: "src/features/blueprints/slices/create-blueprint.ts", startLine: 1, endLine: 3,
+    symbol: "createBlueprint", content: "1: export function createBlueprint() { return draft(); }"
+  };
+  const verdicts = {
+    [answer.filePath]: { yes: -1.0, no: -0.5 },
+    [distractor.filePath]: { yes: -0.5, no: -1.0 }
+  };
+
+  await withModelVerdicts(verdicts, async () => {
+    const r = new Reranker({ baseUrl: "http://127.0.0.1:8034/v1", threshold: 0 });
+    const res = await r.rerank("where a share is created", [distractor, answer]);
+    const top = res.results[0];
+    assert.equal(top.chunk.id, "answer", `ranked: ${res.results.map(x => `${x.chunk.id} ${x.score}`).join(", ")}`);
+    assert.ok(top.rawScore < 0.5, "rawScore must stay the model's own score");
+    assert.ok(top.score > top.rawScore, "the name match must raise the fused score");
+    const other = res.results.find(x => x.chunk.id === "distractor");
+    assert.ok(other.rawScore > 0.5 && other.score < other.rawScore);
+  });
+});
+
+test("Reranker: a chunk the model could not score stays at zero", async () => {
+  const named = {
+    id: "named", filePath: "src/features/sharing/slices/create-share.ts", startLine: 1, endLine: 3,
+    symbol: "createShare", content: "1: export function createShare() { return mint(); }"
+  };
+  const plain = {
+    id: "plain", filePath: "src/misc/util.ts", startLine: 1, endLine: 1, symbol: "util", content: "1: const x = 1;"
+  };
+
+  await withModelVerdicts({ [plain.filePath]: { yes: -2.0, no: -0.2 } }, async () => {
+    const r = new Reranker({ baseUrl: "http://127.0.0.1:8034/v1", threshold: 0 });
+    const res = await r.rerank("where a share is created", [named, plain]);
+    const failed = res.results.find(x => x.chunk.id === "named");
+    assert.ok(failed.error);
+    assert.equal(failed.score, 0);
+    assert.equal(failed.rawScore, 0);
+  });
+});
+
+test("Reranker: a lexical difference inside the noise keeps the model order", async () => {
+  const a = { id: "a", filePath: "src/a/share.ts", startLine: 1, endLine: 1, symbol: "share.ts", content: "1: // share share" };
+  const b = { id: "b", filePath: "src/b/share.ts", startLine: 1, endLine: 1, symbol: "share.ts", content: "1: // share" };
+  const verdicts = {
+    [a.filePath]: { yes: -1.0, no: -0.6 },
+    [b.filePath]: { yes: -0.6, no: -1.0 }
+  };
+
+  await withModelVerdicts(verdicts, async () => {
+    const r = new Reranker({ baseUrl: "http://127.0.0.1:8034/v1", threshold: 0 });
+    const res = await r.rerank("share", [a, b]);
+    assert.deepEqual(res.results.map(x => x.chunk.id), ["b", "a"]);
+  });
 });

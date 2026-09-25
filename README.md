@@ -51,6 +51,8 @@ The **Wide Reranker** is an ultra-high-throughput, prefill-dominant semantic fil
 - Candidates are ranked by how many distinct terms hit (a path hit counts double), with test
   files ranked below implementations, then truncated to the limit. Ordering is by relevance,
   not directory traversal.
+- A path term matches whole tokens, split on separators and camelCase. `share` does not match
+  `shared/`, and `lay` does not match `replay`.
 - Query terms are stemmed with each stem kept beside its root (`migration` → `migrat`,
   `migrate`; `chunking` → `chunk`; `classes` → `class`), so a term cap never severs a stem
   from the word it came from.
@@ -61,6 +63,15 @@ The **Wide Reranker** is an ultra-high-throughput, prefill-dominant semantic fil
 
 ### 8. Architecture-Aware Boundary Slicing (`--by-slice`)
 - Automatically clusters reranked code by architectural domain slice (`features/<slice>`, `modules/<slice>`, `packages/<slice>`).
+
+### 9. Lexical Prior on the Final Score
+- Tier-1 scores every candidate lexically. A query term that names the file or a symbol it
+  declares counts most, then a directory match, then mentions in the body.
+- The final `score` adds that evidence to the model's verdict in logit space:
+  `logit(score) = logit(rawScore) + z`. Here `z` is the chunk's lexical score, standardized
+  over the scored chunks and clipped to ±3. A spread below 3 points counts as noise.
+- `rawScore` stays the model's own score, and a chunk the model could not score stays at 0.
+- The prior costs no model call.
 
 ---
 
