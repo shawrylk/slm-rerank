@@ -53,7 +53,7 @@ test("Two-Tier Filter: pre-filter over 60 candidates with recency bias", () => {
 test("Lexical Score: git-diff recency boost", () => {
   const chunk = { filePath: "src/modified.ts", symbol: "calc", content: "calc()" };
   const scoreNormal = computeLexicalScore(chunk, ["calc"]);
-  const scoreBoosted = computeLexicalScore(chunk, ["calc"], new Set(["src/modified.ts"]));
+  const scoreBoosted = computeLexicalScore(chunk, ["calc"], new Set([path.normalize("src/modified.ts")]));
   assert.ok(scoreBoosted > scoreNormal, "Dirty file should receive recency score boost");
 });
 
