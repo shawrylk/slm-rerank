@@ -41,14 +41,28 @@ export function termKeys(word) {
   return keys;
 }
 
-/** Calls visit(key) for each token, and for each adjacent pair in one word (ToolBar -> toolbar). */
+// Tier-1 splits every word of every candidate; identifiers repeat, so each word is split once.
+const wordKeyCache = new Map();
+const WORD_KEY_CACHE_LIMIT = 100_000;
+
+/** A word's token keys, plus each adjacent pair joined (ToolBar -> toolbar). */
+function wordKeys(word) {
+  let keys = wordKeyCache.get(word);
+  if (keys) return keys;
+  const parts = splitWord(word);
+  keys = [];
+  for (let i = 0; i < parts.length; i += 1) {
+    keys.push(tokenKey(parts[i]));
+    if (i > 0) keys.push(tokenKey(parts[i - 1] + parts[i]));
+  }
+  if (wordKeyCache.size >= WORD_KEY_CACHE_LIMIT) wordKeyCache.clear();
+  wordKeyCache.set(word, keys);
+  return keys;
+}
+
 function eachKey(text, visit) {
   for (const word of String(text || "").match(WORD_RE) || []) {
-    const parts = splitWord(word);
-    for (let i = 0; i < parts.length; i += 1) {
-      visit(tokenKey(parts[i]));
-      if (i > 0) visit(tokenKey(parts[i - 1] + parts[i]));
-    }
+    for (const key of wordKeys(word)) visit(key);
   }
 }
 
@@ -59,10 +73,10 @@ export function tokenKeys(text) {
   return keys;
 }
 
-/** Code -> how often each token key occurs. */
-export function tokenCounts(text) {
+/** Code -> how often each wanted token key occurs. Other keys are not counted. */
+export function tokenCounts(text, wanted) {
   const counts = new Map();
-  eachKey(text, key => counts.set(key, (counts.get(key) || 0) + 1));
+  eachKey(text, key => { if (wanted.has(key)) counts.set(key, (counts.get(key) || 0) + 1); });
   return counts;
 }
 

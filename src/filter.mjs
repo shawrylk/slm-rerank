@@ -50,15 +50,15 @@ export function getGitDiffFiles(cwd = process.cwd()) {
   return dirtyFiles;
 }
 
-/** A chunk's names (file name, declared symbols) and its path, as token keys. */
-function chunkKeys(chunk) {
+/** A chunk's names (file name, declared symbols), its path, and the counts of the wanted keys in its body. */
+function chunkKeys(chunk, wanted) {
   const segments = String(chunk.filePath || "").split(/[\x5c/]/);
   const base = (segments.pop() || "").replace(/\.[^.]+$/, "");
   const names = [base, chunk.symbol || "", ...declaredNames(chunk.content)].join(" ");
   return {
     name: tokenKeys(names),
     path: tokenKeys([...segments, base].join(" ")),
-    body: tokenCounts(chunk.content)
+    body: tokenCounts(chunk.content, wanted)
   };
 }
 
@@ -66,10 +66,10 @@ export function computeLexicalScore(chunk, queryTerms, gitDiffFiles = null) {
   if (!queryTerms.length && !gitDiffFiles) return 0.5;
   let score = 0;
   const pathNorm = path.normalize(chunk.filePath || "");
-  const { name, path: pathKeys, body } = chunkKeys(chunk);
+  const termKeyList = queryTerms.map(termKeys);
+  const { name, path: pathKeys, body } = chunkKeys(chunk, new Set(termKeyList.flat()));
 
-  for (const term of queryTerms) {
-    const keys = termKeys(term);
+  for (const keys of termKeyList) {
     // The file or a symbol it declares is named after the term
     if (containsTerm(name, keys)) {
       score += 10.0;
