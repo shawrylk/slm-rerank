@@ -20,6 +20,7 @@ import {
 import { handleMcpMessage } from "./mcp.mjs";
 import { Reranker } from "./client.mjs";
 import { expandQuery, formatExpansionPrompt, parseExpansionText } from "./expander.mjs";
+import { containsTerm, termKeys, tokenKeys } from "./lexical.mjs";
 
 test("Two-Tier Filter: bypass under 60 candidates", () => {
   const chunks = Array.from({ length: 40 }, (_, i) => ({
@@ -702,3 +703,98 @@ test("formatPrompt: emits the ChatML binary-evaluator prompt with file, line and
   assert.ok(prompt.includes("Respond only with yes or no.<|im_end|>"));
   assert.ok(prompt.endsWith("<|im_start|>assistant\n<think>\n</think>\n"));
 });
+
+test("Lexical: a term matches whole tokens, never a substring of another word", () => {
+  const has = (text, word) => containsTerm(tokenKeys(text), termKeys(word));
+
+  // every feature has a shared/ directory; it is not a share
+  assert.equal(has("src/features/photos/shared/queries", "share"), false);
+  assert.equal(has("src/features/sharing/slices/create-share", "share"), true);
+  assert.equal(has("SharePhotosDialog", "share"), true);
+  assert.equal(has("shares", "share"), true);
+
+  // the verb form in a query reaches the base form in code
+  assert.equal(has("createShare", "created"), true);
+  assert.equal(has("deleteFolder", "delete"), true);
+  assert.equal(has("blackboard/slices/folders", "folder"), true);
+  assert.equal(has("runMigrate", "migration"), true);
+
+  // short words stay short
+  assert.equal(has("mobile-sync/slices/run-replay", "lay"), false);
+  assert.equal(has("patterns/layouts/overlay-placement", "lay"), false);
+  assert.equal(has("application/ports/storage", "app"), false);
+  assert.equal(has("shell/chrome/app-header", "app"), true);
+
+  // a query word written as one word still meets a camelCase identifier
+  assert.equal(has("const store = openIndexedDB();", "indexeddb"), true);
+  assert.equal(has("<ToolBar />", "toolbar"), true);
+});
+
+test("Discovery: a path term is a whole token, so a shared/ directory is not a share", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "slm-tokens-"));
+  try {
+    for (const feature of ["audit", "photos", "pins"]) {
+      fs.mkdirSync(path.join(dir, "src", "features", feature, "shared"), { recursive: true });
+      fs.writeFileSync(path.join(dir, "src", "features", feature, "shared", "queries.ts"), "export const rows = [];\n");
+    }
+    fs.mkdirSync(path.join(dir, "src", "features", "sharing", "slices"), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, "src", "features", "sharing", "slices", "create-share.ts"),
+      "export function mint(input) { return input; }\n"
+    );
+    const git = (...args) => spawnSync("git", args, { cwd: dir, encoding: "utf-8" });
+    git("init", "-q", ".");
+    git("add", "-A");
+    git("-c", "user.email=t@example.com", "-c", "user.name=test", "commit", "-qm", "fixture");
+
+    const files = discoverCandidateFiles("share", { cwd: dir });
+    assert.equal(files[0], "src/features/sharing/slices/create-share.ts", `ranked: ${files.join(", ")}`);
+    assert.ok(!files.some(f => f.includes("/shared/")), `a shared/ file matched "share": ${files.join(", ")}`);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Two-Tier Filter: a small candidate set still comes back in lexical order", () => {
+  const frame = { id: "frame", filePath: "src/ui/layout/content-frame.tsx", symbol: "ContentFrame", content: "export function ContentFrame() { return null; }" };
+  const header = { id: "header", filePath: "src/shell/chrome/app-header.tsx", symbol: "AppHeader", content: "export function AppHeader() { return null; }" };
+
+  const res = applyTwoTierFilter([frame, header], "mobile app header", {});
+  assert.equal(res.tier1Applied, false);
+  assert.equal(res.retained.length, 2);
+  assert.equal(res.retained[0].id, "header", "a prompt hook scores only the head, so the head must be the best lexical match");
+});
+
+test("Two-Tier Filter: a shared/ chunk does not outrank the chunk named after the share", () => {
+  const filler = Array.from({ length: 70 }, (_, i) => ({
+    id: `filler_${i}`, filePath: `src/misc/file_${i}.ts`, symbol: `f${i}`, content: "const x = 1;"
+  }));
+  const shared = {
+    id: "shared", filePath: "src/features/photos/shared/types.ts", symbol: "SharedRow",
+    content: "export interface SharedRow {}\n// shared by the shared queries in shared/"
+  };
+  const share = {
+    id: "share", filePath: "src/features/sharing/slices/create-share.ts", symbol: "createShare",
+    content: "export function createShare() {}"
+  };
+
+  const res = applyTwoTierFilter([...filler, shared, share], "where a share is created", {});
+  assert.equal(res.tier1Applied, true);
+  assert.equal(res.retained[0].id, "share");
+  assert.ok(res.retained.indexOf(shared) === -1 || res.retained.indexOf(shared) > 0);
+});
+
+test("Two-Tier Filter: every name a chunk declares counts, not only its first", () => {
+  const panels = {
+    id: "panels", filePath: "src/ui/explorer/explorer-panels.tsx", symbol: "Menu",
+    content: "type Menu = string;\nexport function ExplorerHeader() { return null; }"
+  };
+  const workspace = {
+    id: "workspace", filePath: "src/ui/explorer/workspace-explorer.tsx", symbol: "WorkspaceExplorer",
+    content: "export function WorkspaceExplorer() { /* header, header, header */ return null; }"
+  };
+
+  const res = applyTwoTierFilter([workspace, panels], "explorer header", {});
+  assert.equal(res.retained[0].id, "panels");
+});
+

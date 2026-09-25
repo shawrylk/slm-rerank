@@ -51,6 +51,8 @@ The **Wide Reranker** is an ultra-high-throughput, prefill-dominant semantic fil
 - Candidates are ranked by how many distinct terms hit (a path hit counts double), with test
   files ranked below implementations, then truncated to the limit. Ordering is by relevance,
   not directory traversal.
+- A path term matches whole tokens, split on separators and camelCase. `share` does not match
+  `shared/`, and `lay` does not match `replay`.
 - Query terms are stemmed with each stem kept beside its root (`migration` → `migrat`,
   `migrate`; `chunking` → `chunk`; `classes` → `class`), so a term cap never severs a stem
   from the word it came from.

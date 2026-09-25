@@ -1,6 +1,7 @@
 // Two-Tier Hybrid Search pre-filter with Git-Diff Biasing in pure Node.js ESM
 import { spawnSync } from "node:child_process";
 import path from "node:path";
+import { containsTerm, countTerm, declaredNames, termKeys, tokenCounts, tokenKeys } from "./lexical.mjs";
 
 export const TIER1_BYPASS_MAX_CANDIDATES = 60;
 export const TIER1_SELECT_TOP_N = 80;
@@ -49,25 +50,36 @@ export function getGitDiffFiles(cwd = process.cwd()) {
   return dirtyFiles;
 }
 
+/** A chunk's names (file name, declared symbols) and its path, as token keys. */
+function chunkKeys(chunk) {
+  const segments = String(chunk.filePath || "").split(/[\x5c/]/);
+  const base = (segments.pop() || "").replace(/\.[^.]+$/, "");
+  const names = [base, chunk.symbol || "", ...declaredNames(chunk.content)].join(" ");
+  return {
+    name: tokenKeys(names),
+    path: tokenKeys([...segments, base].join(" ")),
+    body: tokenCounts(chunk.content)
+  };
+}
+
 export function computeLexicalScore(chunk, queryTerms, gitDiffFiles = null) {
   if (!queryTerms.length && !gitDiffFiles) return 0.5;
   let score = 0;
-  const symLower = (chunk.symbol || "").toLowerCase();
   const pathNorm = path.normalize(chunk.filePath || "");
-  const pathLower = pathNorm.toLowerCase();
-  const contentLower = (chunk.content || "").toLowerCase();
+  const { name, path: pathKeys, body } = chunkKeys(chunk);
 
   for (const term of queryTerms) {
-    // Exact symbol match
-    if (symLower.includes(term)) {
+    const keys = termKeys(term);
+    // The file or a symbol it declares is named after the term
+    if (containsTerm(name, keys)) {
       score += 10.0;
     }
     // Path match
-    if (pathLower.includes(term)) {
+    if (containsTerm(pathKeys, keys)) {
       score += 3.0;
     }
     // Content occurrence (BM25 saturating term frequency)
-    const matches = (contentLower.match(new RegExp(term, "g")) || []).length;
+    const matches = countTerm(body, keys);
     if (matches > 0) {
       score += 2.0 * (matches / (matches + 1.2));
     }
@@ -97,26 +109,29 @@ export function applyTwoTierFilter(chunks, query, options = {}) {
     }
   }
 
-  if (full || candidates.length <= TIER1_BYPASS_MAX_CANDIDATES) {
-    return {
-      retained: candidates,
-      tier1Applied: false,
-      reason: full ? "forced_full_scan" : "small_candidate_set"
-    };
-  }
-
+  // Order every candidate set, small ones too: a prompt hook scores only the head.
   const queryTerms = extractTerms(query);
   const scored = candidates.map(chunk => ({
     chunk,
     score: computeLexicalScore(chunk, queryTerms, gitDiffFiles)
   }));
-
   scored.sort((a, b) => b.score - a.score);
-  const retained = scored.slice(0, TIER1_SELECT_TOP_N).map(s => s.chunk);
+
+  if (full || candidates.length <= TIER1_BYPASS_MAX_CANDIDATES) {
+    return {
+      retained: scored.map(s => s.chunk),
+      lexicalScores: scored.map(s => s.score),
+      tier1Applied: false,
+      reason: full ? "forced_full_scan" : "small_candidate_set"
+    };
+  }
+
+  const kept = scored.slice(0, TIER1_SELECT_TOP_N);
 
   return {
-    retained,
+    retained: kept.map(s => s.chunk),
+    lexicalScores: kept.map(s => s.score),
     tier1Applied: true,
-    reason: `filtered_${candidates.length}_to_${retained.length}`
+    reason: `filtered_${candidates.length}_to_${kept.length}`
   };
 }
