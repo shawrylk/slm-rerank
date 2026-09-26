@@ -18,7 +18,8 @@ const CODE = [
   "the api boots with ECONNREFUSED 127.0.0.1:5432, where is the pool created",
   "record.test.ts fails with AssertionError after my change, can you look",
   "where is photo GPS coarsened before storage",
-  "explain the retry in apiClient.request()"
+  "explain the retry in apiClient.request()",
+  'every request fails with "code": "upstream_unavailable"'
 ];
 
 const PROCESS = [
@@ -40,7 +41,9 @@ const PROCESS = [
   "read the brief at plans/s1.md and follow it exactly",
   "why did the hook go quiet yesterday? check lfm status",
   "where are we on the pagination work?",
-  "push the fix for src/hooks/claude-prompt-context.mjs"
+  "push the fix for src/hooks/claude-prompt-context.mjs",
+  "set SLM_HOST to the LAN box and restart lfm",
+  "upgrade Node.js to 24 and rerun it"
 ];
 
 test("isCodeQuestion: the fixture holds at least 20 prompts of both kinds", () => {

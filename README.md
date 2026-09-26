@@ -242,12 +242,14 @@ the 0.4 s that remains.
 `slm-rerank/hooks/claude-prompt-context` is a `UserPromptSubmit` hook. It adds file:line citations
 only when `isCodeQuestion(prompt)` is true: a source path, a code-form symbol, error text, a code
 fence, or a question that locates code. It stays silent on a prompt about process, status, or
-tools. A local shim imports it from the pinned package:
+tools. A local shim imports it from the pinned package. The shim's own exit guards the import
+only, so the package owns the deadline and logs a query that reaches it:
 
 ```js
-setTimeout(() => process.exit(0), 5000).unref();
+const importGuard = setTimeout(() => process.exit(0), 5000);
 try {
   const { runPromptHook } = await import("slm-rerank/hooks/claude-prompt-context");
+  clearTimeout(importGuard);
   await runPromptHook();
 } catch {
   process.exit(0);
