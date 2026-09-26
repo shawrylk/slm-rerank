@@ -1,10 +1,15 @@
 import { createRequire } from "node:module";
-export { Reranker } from "./client.mjs";
-export { applyTwoTierFilter, computeLexicalScore, getGitDiffFiles } from "./filter.mjs";
-export { chunkFile, prepareCandidates } from "./chunker.mjs";
+export { DEFAULT_RERANK_TOP, Reranker } from "./client.mjs";
+export { applyTwoTierFilter, computeLexicalScore, getGitDiffFiles, rankLexical } from "./filter.mjs";
+export { chunkFile, placeSlice, prepareCandidates, sliceContent } from "./chunker.mjs";
+export { prepareCandidatesCached } from "./chunk-cache.mjs";
+export { resolveCacheDir } from "./cache-dir.mjs";
+export { appendUsage, readUsage, usageLogPath } from "./usage/log.mjs";
+export { formatStats, summarizeUsage } from "./usage/stats.mjs";
+export { isCodeQuestion, isMachineText } from "./hooks/code-question.mjs";
 export { fuseLexicalPrior } from "./fusion.mjs";
 export { stitchChunkContext } from "./stitcher.mjs";
-export { generateGhostStub } from "./stubber.mjs";
+export { attachGhostStubs, generateGhostStub } from "./stubber.mjs";
 export { detectSlice, groupBySlice } from "./boundary.mjs";
 export {
   autoDiscoverEndpoint,
