@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { applyTwoTierFilter, computeLexicalScore } from "./filter.mjs";
+import { applyTwoTierFilter, computeLexicalScore, extractTerms, rankLexical } from "./filter.mjs";
 import { chunkFile } from "./chunker.mjs";
 import { stitchChunkContext } from "./stitcher.mjs";
 import { generateGhostStub } from "./stubber.mjs";
@@ -901,4 +901,63 @@ test("Fusion: the default population is the scored set, as rerank() uses it", ()
 test("VERSION is the version in package.json", () => {
   const { version } = createRequire(import.meta.url)("../package.json");
   assert.equal(VERSION, version);
+});
+
+test("Tier-1: a snake_case query term matches the words the chunk text splits it into", () => {
+  assert.deepEqual(extractTerms("where is app.tenant_id set"), ["app", "tenant", "id", "set"]);
+  const chunk = { filePath: "src/db/session.ts", symbol: "session.ts", content: "1: select set_config('app.tenant_id', $1, true)" };
+  const other = { filePath: "src/db/pool.ts", symbol: "pool.ts", content: "1: const pool = createPool()" };
+  const terms = extractTerms("tenant_id");
+  assert.ok(computeLexicalScore(chunk, terms) > computeLexicalScore(other, terms));
+});
+
+const lexicalFixture = () => [
+  { id: "a", filePath: "src/a/other.ts", startLine: 1, endLine: 1, symbol: "other.ts", content: "1: // other" },
+  { id: "b", filePath: "src/b/share.ts", startLine: 1, endLine: 1, symbol: "share.ts", content: "1: export function share() {}" }
+];
+
+test("rankLexical: returns the Tier-1 order without a model call", () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => { throw new Error("rankLexical must not call a model"); };
+  try {
+    const res = rankLexical("share", lexicalFixture());
+    assert.equal(res.mode, "fast");
+    assert.deepEqual(res.results.map(r => r.chunk.id), ["b", "a"]);
+    assert.equal(res.results[0].score, res.results[0].lexicalScore);
+    assert.equal(res.totalEvaluated, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+const headFixture = () => Array.from({ length: 6 }, (_, i) => ({
+  id: `c${i}`, filePath: `src/f${i}/share${i}.ts`, startLine: 1, endLine: 1, symbol: `share${i}.ts`,
+  content: `1: ${"share ".repeat(6 - i)}`
+}));
+const allYes = chunks => Object.fromEntries(chunks.map(c => [c.filePath, { yes: -0.1, no: -3 }]));
+
+test("Reranker: the model scores only the rerankTop head of the lexical order", async () => {
+  const chunks = headFixture();
+  let calls = 0;
+  await withModelVerdicts(allYes(chunks), async () => {
+    const counting = globalThis.fetch;
+    globalThis.fetch = async (url, init) => { calls += 1; return counting(url, init); };
+    const r = new Reranker({ baseUrl: "http://127.0.0.1:8034/v1", threshold: 0 });
+    const res = await r.rerank("share", chunks, { rerankTop: 2 });
+    assert.equal(calls, 2);
+    assert.equal(res.modelScored, 2);
+    assert.deepEqual(res.results.map(x => x.chunk.id).sort(), ["c0", "c1"]);
+  });
+});
+
+test("Reranker: full scores every kept chunk, whatever rerankTop says", async () => {
+  const chunks = headFixture();
+  let calls = 0;
+  await withModelVerdicts(allYes(chunks), async () => {
+    const counting = globalThis.fetch;
+    globalThis.fetch = async (url, init) => { calls += 1; return counting(url, init); };
+    const r = new Reranker({ baseUrl: "http://127.0.0.1:8034/v1", threshold: 0 });
+    await r.rerank("share", chunks, { rerankTop: 2, full: true });
+    assert.equal(calls, 6);
+  });
 });

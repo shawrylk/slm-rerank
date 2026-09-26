@@ -3,12 +3,19 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import { parseArgs } from "node:util";
-import { Reranker } from "../src/client.mjs";
-import { prepareCandidates } from "../src/chunker.mjs";
+import { DEFAULT_RERANK_TOP, Reranker } from "../src/client.mjs";
+import { prepareCandidatesCached } from "../src/chunk-cache.mjs";
 import { autoDiscoverEndpoint, discoverCandidateFiles, resolveHostEnv } from "../src/discovery.mjs";
 import { groupBySlice } from "../src/boundary.mjs";
 import { expandQuery } from "../src/expander.mjs";
+import { rankLexical } from "../src/filter.mjs";
 import { startMcpServer } from "../src/mcp.mjs";
+import { attachGhostStubs } from "../src/stubber.mjs";
+import { appendUsage, readUsage, usageLogPath } from "../src/usage/log.mjs";
+import { formatStats, summarizeUsage } from "../src/usage/stats.mjs";
+
+// --fast has no threshold to cut its list, so it prints this many results unless -k says otherwise.
+const FAST_DEFAULT_TOP = 10;
 
 const options = {
   query: { type: "string", short: "q" },
@@ -25,6 +32,8 @@ const options = {
   "git-diff": { type: "boolean", default: false },
   "by-slice": { type: "boolean", default: false },
   expand: { type: "boolean", default: false },
+  fast: { type: "boolean", default: false },
+  "rerank-top": { type: "string" },
   json: { type: "boolean", default: false },
   mcp: { type: "boolean", default: false },
   help: { type: "boolean", short: "h" }
@@ -33,6 +42,7 @@ const options = {
 function printHelp() {
   console.log(`
 Usage: slm-rerank --query <query> [options] [files...]
+       slm-rerank stats [--json]   Summarize the usage log
 
 Options:
   -q, --query <string>     Search query (required)
@@ -47,6 +57,10 @@ Options:
       --by-slice           Group results by architectural vertical slice
       --expand             Ask the local model for extra search terms before
                            auto-discovery (opt-in; one extra model call)
+      --fast               Return the lexical ranking with no model call
+                           (a list of files for a planning agent)
+      --rerank-top <int>   Chunks the model scores, from the head of the
+                           lexical order (default: ${DEFAULT_RERANK_TOP})
       --full               Force full GPU evaluation (bypass Tier-1 filter)
       --with-context       Stitch 1-hop type and call context (<= 150 tokens)
       --json               Output raw JSON
@@ -67,14 +81,16 @@ async function runNative(query, files, parsed) {
   const dirtyOnly = parsed.values.dirty;
   const gitDiff = parsed.values["git-diff"] || parsed.values.dirty;
   const showBySlice = parsed.values["by-slice"];
-  const topK = parsed.values.top ? parseInt(parsed.values.top, 10) : undefined;
+  const fast = parsed.values.fast;
+  const topK = parsed.values.top ? parseInt(parsed.values.top, 10) : fast ? FAST_DEFAULT_TOP : undefined;
   const threshold = parsed.values.threshold ? parseFloat(parsed.values.threshold) : 0.65;
+  const rerankTop = parsed.values["rerank-top"] ? parseInt(parsed.values["rerank-top"], 10) : DEFAULT_RERANK_TOP;
 
   let baseUrl = parsed.values["base-url"];
   let detectedPort = null;
   let detectedModel = null;
 
-  if (!baseUrl) {
+  if (!baseUrl && !fast) {
     const discovered = await autoDiscoverEndpoint({ host, requestedModel });
     if (!discovered.url) {
       console.error(`Error: ${discovered.reason}`);
@@ -85,46 +101,56 @@ async function runNative(query, files, parsed) {
     detectedModel = discovered.modelId;
   }
 
-  const chunks = prepareCandidates(files);
+  const chunks = prepareCandidatesCached(files);
   if (!chunks.length) {
     console.error("Error: No candidate code chunks found in target paths.");
     process.exit(1);
   }
 
-  const reranker = new Reranker({
-    baseUrl,
-    model: requestedModel || "lfm",
-    threshold
-  });
-
-  const result = await reranker.rerank(query, chunks, {
-    withContext,
-    full,
-    stub: withStub,
-    gitDiff,
-    dirtyOnly
-  });
+  let result;
+  if (fast) {
+    result = rankLexical(query, chunks, { full, gitDiff, dirtyOnly });
+    result.results = result.results.slice(0, topK);
+    if (withStub) attachGhostStubs(result.results);
+  } else {
+    const reranker = new Reranker({ baseUrl, model: requestedModel || "lfm", threshold, rerankTop });
+    result = await reranker.rerank(query, chunks, { withContext, full, stub: withStub, gitDiff, dirtyOnly });
+  }
 
   if (topK && result.results.length > topK) {
     result.results = result.results.slice(0, topK);
   }
+
+  appendUsage({
+    caller: "cli",
+    query,
+    mode: result.mode,
+    latencyMs: Math.round(performance.now()),
+    top: result.results.map(({ chunk }) => `${chunk.filePath}:${chunk.startLine}-${chunk.endLine}`)
+  });
 
   if (parsed.values.json) {
     console.log(JSON.stringify(result, null, 2));
     return;
   }
 
-  const endpointInfo = detectedPort ? `port :${detectedPort} (${detectedModel})` : baseUrl;
-  console.log(`\n🎯 SLM Semantic Reranker via ${endpointInfo}`);
-  console.log(`Evaluated ${result.totalEvaluated} chunks | Query: "${query}"\n`);
+  const scoreText = score => (fast ? `Lexical: ${score.toFixed(1)}` : `Score: ${(score * 100).toFixed(1)}%`);
+  if (fast) {
+    console.log(`\n⚡ Lexical ranking (--fast, no model call)`);
+    console.log(`Ranked ${result.totalEvaluated} chunks | Query: "${query}"\n`);
+  } else {
+    const endpointInfo = detectedPort ? `port :${detectedPort} (${detectedModel})` : baseUrl;
+    console.log(`\n🎯 SLM Semantic Reranker via ${endpointInfo}`);
+    console.log(`Evaluated ${result.totalEvaluated} chunks, model scored ${result.modelScored} | Query: "${query}"\n`);
+  }
 
   if (showBySlice) {
     const groups = groupBySlice(result.results);
     for (const [sliceName, group] of Object.entries(groups)) {
-      console.log(`📦 [Slice: ${sliceName}] (${group.items.length} matches, max score: ${(group.maxScore * 100).toFixed(1)}%)`);
+      console.log(`📦 [Slice: ${sliceName}] (${group.items.length} matches, max ${scoreText(group.maxScore)})`);
       group.items.forEach((item, idx) => {
         const sym = item.chunk.symbol ? `(${item.chunk.symbol})` : "";
-        console.log(`    #${idx + 1} | ${(item.score * 100).toFixed(1)}% | ${item.chunk.filePath}:${item.chunk.startLine}-${item.chunk.endLine} ${sym}`);
+        console.log(`    #${idx + 1} | ${scoreText(item.score)} | ${item.chunk.filePath}:${item.chunk.startLine}-${item.chunk.endLine} ${sym}`);
       });
       console.log("");
     }
@@ -132,7 +158,7 @@ async function runNative(query, files, parsed) {
     result.results.forEach((item, idx) => {
       const sym = item.chunk.symbol ? `(${item.chunk.symbol})` : "";
       const sliceTag = item.slice ? `[${item.slice}] ` : "";
-      console.log(` #${idx + 1} | Score: ${(item.score * 100).toFixed(1)}% | ${sliceTag}${item.chunk.filePath}:${item.chunk.startLine}-${item.chunk.endLine} ${sym}`);
+      console.log(` #${idx + 1} | ${scoreText(item.score)} | ${sliceTag}${item.chunk.filePath}:${item.chunk.startLine}-${item.chunk.endLine} ${sym}`);
 
       if (withStub && item.ghostStub) {
         console.log(`\n--- 👻 Ghost Stub (${item.foldedLines} lines folded) ---`);
@@ -166,6 +192,11 @@ async function main() {
   }
 
   const query = parsed.values.query;
+  if (!query && parsed.positionals[0] === "stats") {
+    const summary = summarizeUsage(readUsage());
+    console.log(parsed.values.json ? JSON.stringify(summary, null, 2) : formatStats(summary, usageLogPath()));
+    return;
+  }
   if (!query) {
     console.error("Error: --query is required.");
     printHelp();

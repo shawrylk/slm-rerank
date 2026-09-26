@@ -18,7 +18,8 @@ const GENERIC_STOPWORDS = new Set([
 
 export function extractTerms(text) {
   if (!text) return [];
-  const words = text.toLowerCase().match(/\b[a-z0-9_]+\b/g) || [];
+  // The chunk side splits tenant_id into tenant and id, so a query term splits the same way.
+  const words = (text.toLowerCase().match(/\b[a-z0-9_]+\b/g) || []).flatMap(w => w.split("_"));
   return words.filter(w => w.length >= 2 && !GENERIC_STOPWORDS.has(w));
 }
 
@@ -133,5 +134,18 @@ export function applyTwoTierFilter(chunks, query, options = {}) {
     lexicalScores: kept.map(s => s.score),
     tier1Applied: true,
     reason: `filtered_${candidates.length}_to_${kept.length}`
+  };
+}
+
+/** The Tier-1 order as a result, with no model call: `--fast`, for an agent that needs a list of files. */
+export function rankLexical(query, chunks, options = {}) {
+  const { retained, lexicalScores, tier1Applied, reason } = applyTwoTierFilter(chunks, query, options);
+  return {
+    query,
+    mode: "fast",
+    results: retained.map((chunk, i) => ({ chunk, score: lexicalScores[i], lexicalScore: lexicalScores[i] })),
+    totalEvaluated: retained.length,
+    tier1Applied,
+    filterReason: reason
   };
 }

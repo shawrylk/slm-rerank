@@ -1,6 +1,6 @@
 {
   "name": "slm-rerank",
-  "version": "0.9.1",
+  "version": "0.10.0",
   "type": "module",
   "description": "Model-Agnostic Semantic Wide Reranker with 1-Token Logprob Scoring & AST Chunking",
   "license": "MIT",
@@ -36,6 +36,7 @@
   },
   "exports": {
     ".": "./src/index.mjs",
+    "./hooks/claude-prompt-context": "./src/hooks/claude-prompt-context.mjs",
     "./package.json": "./package.json"
   },
   "files": [

@@ -1,5 +1,15 @@
 import fs from "node:fs";
 
+/** Adds `ghostStub` and `foldedLines` to each result, in place: `--stub` for the rerank and for `--fast`. */
+export function attachGhostStubs(results) {
+  for (const item of results) {
+    const ghost = generateGhostStub(item.chunk.filePath, item.chunk);
+    item.ghostStub = ghost.stub;
+    item.foldedLines = ghost.foldedLines;
+  }
+  return results;
+}
+
 /**
  * Generate a concise "Ghost Stub" of the enclosing source file.
  * Preserves imports, types, and the full implementation of the target chunk,

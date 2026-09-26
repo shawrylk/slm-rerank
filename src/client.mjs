@@ -1,8 +1,11 @@
 // Reranker Client for Node.js: model-agnostic binary logprob evaluator with Ghost Stubs & Slice Boundaries
 import { detectSlice, groupBySlice } from "./boundary.mjs";
-import { generateGhostStub } from "./stubber.mjs";
+import { attachGhostStubs } from "./stubber.mjs";
 import { resolveEndpointEnv } from "./discovery.mjs";
 import { fuseLexicalPrior } from "./fusion.mjs";
+
+// The answer sits near the head of the lexical order, and each batch of chunks costs one model round trip.
+export const DEFAULT_RERANK_TOP = 16;
 
 // Length-normalized sigmoid calibration (mirrors slm_rerank.adapters.ModelProfile.calibrate_score).
 const LENGTH_NORM_EXPONENT = 0.15;
@@ -98,6 +101,7 @@ export class Reranker {
     this.model = options.model || "lfm";
     this.concurrency = options.concurrency || 4;
     this.threshold = options.threshold ?? 0.65;
+    this.rerankTop = options.rerankTop ?? DEFAULT_RERANK_TOP;
   }
 
   formatPrompt(query, chunk, stitchedContext = "") {
@@ -240,38 +244,36 @@ export class Reranker {
     const { applyTwoTierFilter } = await import("./filter.mjs");
     const { retained, lexicalScores, tier1Applied, reason } = applyTwoTierFilter(chunks, query, { full, gitDiff, dirtyOnly });
 
-    // Concurrently score chunks in slots
+    // The model scores the head of the lexical order only; `full` asks for every kept chunk.
+    const rerankTop = full ? retained.length : Math.max(1, options.rerankTop ?? this.rerankTop);
+    const head = retained.slice(0, rerankTop);
     const scored = [];
-    for (let i = 0; i < retained.length; i += this.concurrency) {
-      const batch = retained.slice(i, i + this.concurrency);
+    for (let i = 0; i < head.length; i += this.concurrency) {
+      const batch = head.slice(i, i + this.concurrency);
       const batchResults = await Promise.all(
         batch.map(chunk => this.scoreChunk(query, chunk, withContext))
       );
       scored.push(...batchResults);
     }
 
-    const results = fuseLexicalPrior(scored, lexicalScores);
+    // The head is judged against every kept candidate, or it is judged against itself (fusion.mjs).
+    const results = fuseLexicalPrior(scored, lexicalScores.slice(0, head.length), lexicalScores);
     results.sort((a, b) => b.score - a.score);
 
     const filtered = results.filter(r => r.score >= threshold);
     const finalResults = filtered.length ? filtered : results.slice(0, 3);
 
-    // If stub / skeleton requested, attach Ghost Stub to top candidate results
-    if (stub) {
-      for (const item of finalResults) {
-        const ghost = generateGhostStub(item.chunk.filePath, item.chunk);
-        item.ghostStub = ghost.stub;
-        item.foldedLines = ghost.foldedLines;
-      }
-    }
+    if (stub) attachGhostStubs(finalResults);
 
     const bySlice = groupBySlice(finalResults);
 
     return {
       query,
+      mode: "rerank",
       results: finalResults,
       bySlice,
       totalEvaluated: retained.length,
+      modelScored: head.length,
       tier1Applied,
       filterReason: reason
     };

@@ -5,11 +5,12 @@ import path from "node:path";
 
 const SYMBOL_DEF_RE = /^(?:export\s+|public\s+|static\s+|async\s+)*(?:class|interface|struct|function|def|fn|func|type)\s+([A-Za-z0-9_]+)/m;
 
-export function chunkFile(filePath, content, maxLines = 100, overlap = 20) {
+/** Content -> its slices, which carry no path: the chunk cache (chunk-cache.mjs) stores these by content hash. */
+export function sliceContent(content, maxLines = 100, overlap = 20) {
   const lines = content.split("\n");
   if (lines.length === 0) return [];
 
-  const chunks = [];
+  const slices = [];
   let start = 0;
 
   while (start < lines.length) {
@@ -27,20 +28,29 @@ export function chunkFile(filePath, content, maxLines = 100, overlap = 20) {
       }
     }
 
-    chunks.push({
-      id: `${filePath}:${start + 1}-${end}${symbol ? `:${symbol}` : ""}`,
-      filePath,
-      startLine: start + 1,
-      endLine: end,
-      symbol: symbol || path.basename(filePath),
-      content: numbered
-    });
+    slices.push({ startLine: start + 1, endLine: end, symbol, content: numbered });
 
     if (end >= lines.length) break;
     start += (maxLines - overlap);
   }
 
-  return chunks;
+  return slices;
+}
+
+/** A slice at a path -> a candidate chunk. */
+export function placeSlice(filePath, { startLine, endLine, symbol, content }) {
+  return {
+    id: `${filePath}:${startLine}-${endLine}${symbol ? `:${symbol}` : ""}`,
+    filePath,
+    startLine,
+    endLine,
+    symbol: symbol || path.basename(filePath),
+    content
+  };
+}
+
+export function chunkFile(filePath, content, maxLines = 100, overlap = 20) {
+  return sliceContent(content, maxLines, overlap).map(slice => placeSlice(filePath, slice));
 }
 
 export function prepareCandidates(filePaths) {

@@ -174,6 +174,90 @@ half-weight keeps the rest from doing damage, but expansion quality is bounded b
 
 ---
 
+## Fast answers and the usage log (v0.10.0)
+
+### `--fast`: the lexical ranking, with no model call
+
+`--fast` returns the Tier-1 lexical order and never asks for a model server. It is for a planning
+agent that needs a list of files. It prints 10 results unless `-k` gives another count.
+
+```bash
+slm-rerank -q "where is the S3 presigned URL signed" --fast -k 5
+```
+
+### `--rerank-top`: the model scores the head only
+
+The model scores the first 16 chunks of the lexical order, not all of the chunks that Tier-1 keeps.
+`--rerank-top <n>` changes the count. `--full` still scores every kept chunk. The fused score judges
+the head against every kept candidate, the same as the prompt hook does.
+
+### The slice cache
+
+The slices of each file are stored by the SHA-1 of its content, under `chunks/` in the user cache
+folder. The cache is never in the working tree of the searched repository, so its gates never see
+it.
+
+| Platform | Cache folder |
+| --- | --- |
+| Windows | `%LOCALAPPDATA%\slm-rerank` |
+| macOS | `~/Library/Caches/slm-rerank` |
+| Linux | `$XDG_CACHE_HOME/slm-rerank`, or `~/.cache/slm-rerank` |
+
+`SLM_RERANK_CACHE_DIR` overrides the folder.
+
+### The usage log and `slm-rerank stats`
+
+Each CLI query and each prompt-hook decision appends one JSON line to `usage.jsonl` in the cache
+folder. A line holds the time, the query (its first 500 characters), the caller, the latency, and
+the top paths. A hook line also holds the `isCodeQuestion` decision and its outcome.
+
+```bash
+slm-rerank stats          # query count, median latency by caller, share of hook prompts that queried
+slm-rerank stats --json
+```
+
+### Measured on quality-control-mono
+
+The query set is 10 questions whose answer files were checked by hand, such as "where does the
+router set app.tenant_id". A hit is an answer file among the top 5 results. The local server is
+LFM2.5-8B-A1B Q4_K_M on an RTX 4060.
+
+| Mode | Cold | Warm (median) | Top-5 hits |
+| --- | --- | --- | --- |
+| 0.9.1 rerank (all 80 kept chunks) | 43.8 s | 29.1 s | 9 of 10 |
+| 0.10.0 `--fast` | 0.49 s | 0.42 s | 9 of 10 |
+| 0.10.0 rerank, head of 16 (default) | 8.6 s | 6.3 s | 9 of 10 |
+| 0.10.0 rerank, `--rerank-top 24` | not measured | 8.5 s | 8 of 10 |
+
+Cold means an empty slice cache. The 0.9.1 cold query also woke the model from idle sleep, which
+adds about 2.6 s; the 0.10.0 cold queries ran on a loaded model. Warm means a loaded model, a full
+slice cache, and a query that the server has not seen. The server keeps prompt states, so a
+repeated query costs about 1.3 s.
+
+The slice cache saves about 50 ms of a `--fast` query. The `rg` searches of discovery take most of
+the 0.4 s that remains.
+
+### The Claude Code prompt hook
+
+`slm-rerank/hooks/claude-prompt-context` is a `UserPromptSubmit` hook. It adds file:line citations
+only when `isCodeQuestion(prompt)` is true: a source path, a code-form symbol, error text, a code
+fence, or a question that locates code. It stays silent on a prompt about process, status, or
+tools. A local shim imports it from the pinned package. The shim's own exit guards the import
+only, so the package owns the deadline and logs a query that reaches it:
+
+```js
+const importGuard = setTimeout(() => process.exit(0), 5000);
+try {
+  const { runPromptHook } = await import("slm-rerank/hooks/claude-prompt-context");
+  clearTimeout(importGuard);
+  await runPromptHook();
+} catch {
+  process.exit(0);
+}
+```
+
+---
+
 ## Grounded code review (v0.8.0)
 
 The reranker answers *which chunk is relevant* with a calibrated probability. It writes no prose,
