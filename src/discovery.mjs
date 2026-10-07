@@ -196,7 +196,7 @@ export function extractQueryTerms(query) {
 
 /** Tests mention domain vocabulary constantly; this keeps them from crowding the budget. */
 export function isTestPath(filePath) {
-  const lower = filePath.toLowerCase();
+  const lower = filePath.replaceAll("\\", "/").toLowerCase();
   const base = lower.split("/").pop() || lower;
   return /(^|\/)(tests?|__tests__|specs?)(\/|$)/.test(lower)
     || /\.(test|spec)\.[a-z0-9]+$/.test(base)
@@ -207,7 +207,7 @@ export function isTestPath(filePath) {
 function splitFileList(stdout, cwd, checkExists) {
   const files = [];
   for (const line of stdout.split("\n")) {
-    const trimmed = line.trim();
+    const trimmed = line.trim().replaceAll("\\", "/").replace(/^\.\//, "");
     if (!trimmed || !CODE_EXTS.has(path.extname(trimmed))) continue;
     if (checkExists && !fs.existsSync(path.resolve(cwd, trimmed))) continue;
     files.push(trimmed);
@@ -243,8 +243,9 @@ function findBodyMatches(cwd, terms) {
   let ripgrepUsable = false;
   for (const term of terms) {
     try {
+      // An explicit path prevents rg from searching the empty pipe that spawnSync supplies as stdin.
       const res = spawnSync("rg", [
-        "--files-with-matches", "--ignore-case", "--max-count", "1", ...globArgs(), term
+        "--files-with-matches", "--ignore-case", "--max-count", "1", ...globArgs(), "--", term, "."
       ], { cwd, encoding: "utf-8", maxBuffer: 10 * 1024 * 1024 });
       if (res.error) break;
       ripgrepUsable = true;
